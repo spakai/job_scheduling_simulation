@@ -27,6 +27,8 @@ Start the visibility API:
 ```
 
 The specification and implementation plan are in [`specs/001-scheduled-job-visibility`](specs/001-scheduled-job-visibility/).
+The latest human-readable run report is in
+[`simulation-results/summary.md`](simulation-results/summary.md).
 
 ## Architecture assessment
 
