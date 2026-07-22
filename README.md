@@ -27,6 +27,7 @@ Start the visibility API:
 ```
 
 The specification and implementation plan are in [`specs/001-scheduled-job-visibility`](specs/001-scheduled-job-visibility/).
+The arc42-aligned C4 architecture documentation is in [`architecture.md`](architecture.md).
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).
 
