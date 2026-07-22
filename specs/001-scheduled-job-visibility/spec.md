@@ -1,6 +1,26 @@
-Scheduled Job Visibility Simulation Specification
+# Scheduled Job Visibility Simulation Specification
 
-1. Purpose
+## Contents
+
+- [1. Purpose](#1-purpose)
+- [2. Scope](#2-scope)
+- [3. High-Level Architecture](#3-high-level-architecture)
+- [4. Core Design Principles](#4-core-design-principles)
+- [5. Job Lifecycle](#5-job-lifecycle)
+- [6. Canonical EDR Schema](#6-canonical-edr-schema)
+- [7. Visibility API](#7-visibility-api)
+- [8. Simulation Components](#8-simulation-components)
+- [9. Configuration](#9-configuration)
+- [10. Happy-Path Scenarios](#10-happy-path-scenarios)
+- [11. Chaos Scenarios](#11-chaos-scenarios)
+- [12. Mutable Summary EDR Behaviour](#12-mutable-summary-edr-behaviour)
+- [13. Assertions](#13-assertions)
+- [14. Test Data](#14-test-data)
+- [15. Simulation Execution Format](#15-simulation-execution-format)
+- [16. Success Criteria](#16-success-criteria)
+- [17. Recommended Minimum Scenario Set for CI](#17-recommended-minimum-scenario-set-for-ci)
+
+## 1. Purpose
 
 This specification defines a simulation environment for validating scheduled-job visibility when the scheduler is outside our control and the only reliable integration point is the writing and retrieval of EDRs.
 
@@ -8,54 +28,36 @@ The simulation must verify that the visibility API presents an accurate, explain
 
 The system must never claim that a job exists inside the external scheduler unless scheduler acknowledgement has been observed.
 
-2. Scope
+## 2. Scope
 
 The simulation covers:
 
-Job creation
+- Job creation
+- Scheduler submission
+- Scheduler acknowledgement
+- Scheduled execution
+- Successful completion
+- Failed execution
+- Retry eligibility
+- Retry request
+- Retry acknowledgement
+- Retry execution
+- Retry exhaustion
+- Duplicate EDRs
+- Out-of-order EDRs
+- Missing EDRs
+- Delayed EDR delivery
+- Concurrent updates
+- Stale reads
+- Visibility API behaviour
+- Overdue detection
+- Reconciliation
 
-Scheduler submission
+> The simulation does not attempt to reproduce the internal implementation of the external scheduler.
 
-Scheduler acknowledgement
+## 3. High-Level Architecture
 
-Scheduled execution
-
-Successful completion
-
-Failed execution
-
-Retry eligibility
-
-Retry request
-
-Retry acknowledgement
-
-Retry execution
-
-Retry exhaustion
-
-Duplicate EDRs
-
-Out-of-order EDRs
-
-Missing EDRs
-
-Delayed EDR delivery
-
-Concurrent updates
-
-Stale reads
-
-Visibility API behaviour
-
-Overdue detection
-
-Reconciliation
-
-The simulation does not attempt to reproduce the internal implementation of the external scheduler.
-
-3. High-Level Architecture
-
+```text
 Job Producer
     |
     | writes lifecycle EDRs
@@ -76,114 +78,84 @@ External Scheduler Simulator
     | produces acknowledgement and execution outcomes
     v
 EDR Writer
+```
 
-4. Core Design Principles
+## 4. Core Design Principles
 
-EDRs are observable facts.
+- EDRs are observable facts.
+- The visibility store is a materialized view derived from EDRs.
+- The visibility API exposes business-oriented job state, not raw EDR format.
+- Duplicate EDRs must not corrupt state.
+- Out-of-order EDRs must not move terminal state backwards.
+- Scheduler intent and scheduler acknowledgement must be represented separately.
+- Retry requested and retry scheduled must be represented separately.
+- Missing evidence must be reported as unknown, pending, or overdue rather than assumed.
+- Job state updates must support optimistic concurrency or equivalent version control.
+- Every API response must expose data freshness.
 
-The visibility store is a materialized view derived from EDRs.
+## 5. Job Lifecycle
 
-The visibility API exposes business-oriented job state, not raw EDR format.
+### 5.1 Recorded lifecycle events
 
-Duplicate EDRs must not corrupt state.
+- `JOB_CREATED`
+- `JOB_SCHEDULER_SUBMISSION_REQUESTED`
+- `JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED`
+- `JOB_SCHEDULER_SUBMISSION_FAILED`
+- `JOB_EXECUTION_STARTED`
+- `JOB_EXECUTION_SUCCEEDED`
+- `JOB_EXECUTION_FAILED`
+- `JOB_RETRY_REQUESTED`
+- `JOB_RETRY_ACKNOWLEDGED`
+- `JOB_RETRY_REJECTED`
+- `JOB_RETRIES_EXHAUSTED`
+- `JOB_CANCELLED`
 
-Out-of-order EDRs must not move terminal state backwards.
+### 5.2 Derived visibility states
 
-Scheduler intent and scheduler acknowledgement must be represented separately.
+- `CREATED`
+- `PENDING_SUBMISSION`
+- `SCHEDULED`
+- `AWAITING_EXECUTION`
+- `RUNNING`
+- `RETRY_PENDING`
+- `RETRY_SCHEDULED`
+- `SUCCEEDED`
+- `FAILED`
+- `RETRIES_EXHAUSTED`
+- `OVERDUE`
+- `CANCELLED`
+- `UNKNOWN`
 
-Retry requested and retry scheduled must be represented separately.
+### 5.3 State rules
 
-Missing evidence must be reported as unknown, pending, or overdue rather than assumed.
+| Observed evidence or rule | Derived visibility state |
+| --- | --- |
+| `JOB_CREATED` | `CREATED` |
+| `JOB_SCHEDULER_SUBMISSION_REQUESTED` | `PENDING_SUBMISSION` |
+| `JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED` | `SCHEDULED` |
+| scheduledAt passed, within grace period, no start observed | `AWAITING_EXECUTION` |
+| scheduledAt + grace period passed, no start observed | `OVERDUE` |
+| `JOB_EXECUTION_STARTED` | `RUNNING` |
+| `JOB_EXECUTION_SUCCEEDED` | `SUCCEEDED` |
+| `JOB_EXECUTION_FAILED and retryable = false` | `FAILED` |
+| `JOB_EXECUTION_FAILED and retryable = true and retry not yet requested` | `RETRY_PENDING` |
+| `JOB_RETRY_REQUESTED without acknowledgement` | `RETRY_PENDING` |
+| `JOB_RETRY_ACKNOWLEDGED` | `RETRY_SCHEDULED` |
+| `JOB_RETRIES_EXHAUSTED` | `RETRIES_EXHAUSTED` |
+| `JOB_CANCELLED` | `CANCELLED` |
 
-Job state updates must support optimistic concurrency or equivalent version control.
+**Terminal states**
 
-Every API response must expose data freshness.
+- `SUCCEEDED`
+- `FAILED`
+- `RETRIES_EXHAUSTED`
+- `CANCELLED`
 
-5. Job Lifecycle
+> A late non-terminal event must not move a job out of a terminal state.
 
-5.1 Recorded lifecycle events
+## 6. Canonical EDR Schema
 
-JOB_CREATED
-JOB_SCHEDULER_SUBMISSION_REQUESTED
-JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED
-JOB_SCHEDULER_SUBMISSION_FAILED
-JOB_EXECUTION_STARTED
-JOB_EXECUTION_SUCCEEDED
-JOB_EXECUTION_FAILED
-JOB_RETRY_REQUESTED
-JOB_RETRY_ACKNOWLEDGED
-JOB_RETRY_REJECTED
-JOB_RETRIES_EXHAUSTED
-JOB_CANCELLED
-
-5.2 Derived visibility states
-
-CREATED
-PENDING_SUBMISSION
-SCHEDULED
-AWAITING_EXECUTION
-RUNNING
-RETRY_PENDING
-RETRY_SCHEDULED
-SUCCEEDED
-FAILED
-RETRIES_EXHAUSTED
-OVERDUE
-CANCELLED
-UNKNOWN
-
-5.3 State rules
-
-JOB_CREATED
-  -> CREATED
-
-JOB_SCHEDULER_SUBMISSION_REQUESTED
-  -> PENDING_SUBMISSION
-
-JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED
-  -> SCHEDULED
-
-scheduledAt passed, within grace period, no start observed
-  -> AWAITING_EXECUTION
-
-scheduledAt + grace period passed, no start observed
-  -> OVERDUE
-
-JOB_EXECUTION_STARTED
-  -> RUNNING
-
-JOB_EXECUTION_SUCCEEDED
-  -> SUCCEEDED
-
-JOB_EXECUTION_FAILED and retryable = false
-  -> FAILED
-
-JOB_EXECUTION_FAILED and retryable = true and retry not yet requested
-  -> RETRY_PENDING
-
-JOB_RETRY_REQUESTED without acknowledgement
-  -> RETRY_PENDING
-
-JOB_RETRY_ACKNOWLEDGED
-  -> RETRY_SCHEDULED
-
-JOB_RETRIES_EXHAUSTED
-  -> RETRIES_EXHAUSTED
-
-JOB_CANCELLED
-  -> CANCELLED
-
-Terminal states are:
-
-SUCCEEDED
-FAILED
-RETRIES_EXHAUSTED
-CANCELLED
-
-A late non-terminal event must not move a job out of a terminal state.
-
-6. Canonical EDR Schema
-
+```json
 {
   "eventId": "evt-001",
   "eventType": "JOB_CREATED",
@@ -206,15 +178,17 @@ A late non-terminal event must not move a job out of a terminal state.
   "version": 1,
   "payloadReference": "subscription-456"
 }
+```
 
-7. Visibility API
+## 7. Visibility API
 
-7.1 Retrieve job
+### 7.1 Retrieve job
 
-GET /scheduled-jobs/{jobId}
+- `GET /scheduled-jobs/{jobId}`
 
-Example response:
+**Example response**
 
+```json
 {
   "jobId": "job-123",
   "correlationId": "subscription-456:RENEW:2026-07-23",
@@ -240,108 +214,97 @@ Example response:
   "dataAsOf": "2026-07-23T00:00:40Z",
   "version": 7
 }
+```
 
-7.2 Retrieve attempts
+### 7.2 Retrieve attempts
 
-GET /scheduled-jobs/{jobId}/attempts
+- `GET /scheduled-jobs/{jobId}/attempts`
 
-7.3 Search jobs
+### 7.3 Search jobs
 
-GET /scheduled-jobs?status=OVERDUE
-GET /scheduled-jobs?status=RETRY_PENDING
-GET /scheduled-jobs?correlationId=...
-GET /scheduled-jobs?scheduledFrom=...&scheduledTo=...
+- `GET /scheduled-jobs?status=OVERDUE`
+- `GET /scheduled-jobs?status=RETRY_PENDING`
+- `GET /scheduled-jobs?correlationId=...`
+- `GET /scheduled-jobs?scheduledFrom=...&scheduledTo=...`
 
-7.4 Missing job response
+### 7.4 Missing job response
 
-404 Not Found
+**404 Not Found**
 
+```json
 {
   "code": "JOB_VISIBILITY_RECORD_NOT_FOUND",
   "message": "No job visibility record was found for the supplied job ID.",
   "meaning": "The absence of a visibility record does not prove that the external scheduler has no such job."
 }
+```
 
-8. Simulation Components
+## 8. Simulation Components
 
-8.1 Job Producer Simulator
+### 8.1 Job Producer Simulator
 
-Responsibilities:
+**Responsibilities**
 
-Create jobs
+- Create jobs
+- Write JOB_CREATED
+- Write scheduler submission request EDR
+- Optionally simulate write failure
+- Optionally simulate duplicate submission
 
-Write JOB_CREATED
+### 8.2 Scheduler Simulator
 
-Write scheduler submission request EDR
+**Supported modes**
 
-Optionally simulate write failure
+- NORMAL
+- ACK_DELAYED
+- ACK_DROPPED
+- ACK_DUPLICATED
+- EXECUTION_DELAYED
+- EXECUTION_DROPPED
+- EXECUTION_DUPLICATED
+- EXECUTION_FAILED
+- RETRY_ACCEPTED
+- RETRY_REJECTED
+- RETRY_DROPPED
 
-Optionally simulate duplicate submission
+### 8.3 EDR Transport Simulator
 
-8.2 Scheduler Simulator
+**Supported faults**
 
-Supported modes:
+- NO_FAULT
+- DUPLICATE
+- DROP
+- DELAY
+- REORDER
+- CORRUPT_OPTIONAL_FIELD
+- BURST_DELIVERY
 
-NORMAL
-ACK_DELAYED
-ACK_DROPPED
-ACK_DUPLICATED
-EXECUTION_DELAYED
-EXECUTION_DROPPED
-EXECUTION_DUPLICATED
-EXECUTION_FAILED
-RETRY_ACCEPTED
-RETRY_REJECTED
-RETRY_DROPPED
+### 8.4 Visibility Projector
 
-8.3 EDR Transport Simulator
+**Responsibilities**
 
-Supported faults:
+- Deduplicate by eventId
+- Order by eventTime and lifecycle precedence
+- Preserve terminal states
+- Maintain current job summary
+- Maintain attempt summaries
+- Increment record version
+- Record last processed ingestion time
 
-NO_FAULT
-DUPLICATE
-DROP
-DELAY
-REORDER
-CORRUPT_OPTIONAL_FIELD
-BURST_DELIVERY
+### 8.5 Reconciler
 
-8.4 Visibility Projector
+**Responsibilities**
 
-Responsibilities:
+- Detect overdue jobs
+- Detect stuck RUNNING jobs
+- Detect retry requested but not acknowledged
+- Detect expired retry windows
+- Detect inconsistent attempt counters
+- Emit reconciliation findings
 
-Deduplicate by eventId
+## 9. Configuration
 
-Order by eventTime and lifecycle precedence
-
-Preserve terminal states
-
-Maintain current job summary
-
-Maintain attempt summaries
-
-Increment record version
-
-Record last processed ingestion time
-
-8.5 Reconciler
-
-Responsibilities:
-
-Detect overdue jobs
-
-Detect stuck RUNNING jobs
-
-Detect retry requested but not acknowledged
-
-Detect expired retry windows
-
-Detect inconsistent attempt counters
-
-Emit reconciliation findings
-
-9. Configuration
-
+```yaml
 gracePeriodSeconds: 600
 runningTimeoutSeconds: 1800
 retryAcknowledgementTimeoutSeconds: 120
@@ -352,490 +315,431 @@ retryBackoffSeconds:
   - 900
 deduplicationRetentionSeconds: 86400
 eventualConsistencyTargetSeconds: 10
+```
 
-10. Happy-Path Scenarios
+## 10. Happy-Path Scenarios
 
-HP-01: Job created and scheduled successfully
+### HP-01 — Job created and scheduled successfully
 
-Given:
+**Given**
 
-A valid job request
+- A valid job request
+- Scheduler acknowledges submission
+- Scheduled time is in the future
 
-Scheduler acknowledges submission
+**Events**
 
-Scheduled time is in the future
+- `JOB_CREATED`
+- `JOB_SCHEDULER_SUBMISSION_REQUESTED`
+- `JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED`
 
-Events:
+**Expected API state**
 
-JOB_CREATED
-JOB_SCHEDULER_SUBMISSION_REQUESTED
-JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED
+> `SCHEDULED`
 
-Expected API state:
+**Acceptance criteria**
 
-SCHEDULED
+- schedulerReference is present
+- scheduledAt is preserved
+- retry.completedAttempts = 0
+- dataAsOf is present
 
-Acceptance criteria:
+### HP-02 — Job executes successfully
 
-schedulerReference is present
+**Events**
 
-scheduledAt is preserved
+- `JOB_CREATED`
+- `JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED`
+- `JOB_EXECUTION_STARTED`
+- `JOB_EXECUTION_SUCCEEDED`
 
-retry.completedAttempts = 0
+**Expected API state**
 
-dataAsOf is present
+> `SUCCEEDED`
 
-HP-02: Job executes successfully
+**Acceptance criteria**
 
-Events:
+- startedAt is populated
+- completedAt is populated
+- attempt count is 1
+- completedAt >= startedAt
+- terminal state remains stable
 
-JOB_CREATED
-JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED
-JOB_EXECUTION_STARTED
-JOB_EXECUTION_SUCCEEDED
+### HP-03 — Job fails and retry is scheduled
 
-Expected API state:
+**Events**
 
-SUCCEEDED
+- `JOB_EXECUTION_STARTED` attempt=1
+- `JOB_EXECUTION_FAILED` attempt=1 retryable=true
+- `JOB_RETRY_REQUESTED` nextAttempt=2
+- `JOB_RETRY_ACKNOWLEDGED` nextAttempt=2
 
-Acceptance criteria:
+**Expected API state**
 
-startedAt is populated
+> `RETRY_SCHEDULED`
 
-completedAt is populated
+**Acceptance criteria**
 
-attempt count is 1
+- completedAttempts = 1
+- nextAttemptNumber = 2
+- nextRetryAt is populated
+- schedulerAcknowledged = true
 
-completedAt >= startedAt
+### HP-04 — Retry succeeds
 
-terminal state remains stable
+**Events**
 
-HP-03: Job fails and retry is scheduled
+- `JOB_EXECUTION_FAILED` attempt=1
+- `JOB_RETRY_ACKNOWLEDGED` nextAttempt=2
+- `JOB_EXECUTION_STARTED` attempt=2
+- `JOB_EXECUTION_SUCCEEDED` attempt=2
 
-Events:
+**Expected API state**
 
-JOB_EXECUTION_STARTED attempt=1
-JOB_EXECUTION_FAILED attempt=1 retryable=true
-JOB_RETRY_REQUESTED nextAttempt=2
-JOB_RETRY_ACKNOWLEDGED nextAttempt=2
+> `SUCCEEDED`
 
-Expected API state:
+**Acceptance criteria**
 
-RETRY_SCHEDULED
+- completedAttempts = 2
+- attempt 1 shows FAILED
+- attempt 2 shows SUCCEEDED
+- final result is SUCCESS
 
-Acceptance criteria:
+### HP-05 — Retry exhausted
 
-completedAttempts = 1
+**Events**
 
-nextAttemptNumber = 2
+- `JOB_EXECUTION_FAILED` attempt=1 retryable=true
+- `JOB_EXECUTION_FAILED` attempt=2 retryable=true
+- `JOB_EXECUTION_FAILED` attempt=3 retryable=false
+- `JOB_RETRIES_EXHAUSTED`
 
-nextRetryAt is populated
+**Expected API state**
 
-schedulerAcknowledged = true
+> `RETRIES_EXHAUSTED`
 
-HP-04: Retry succeeds
+**Acceptance criteria**
 
-Events:
+- completedAttempts = 3
+- nextRetryAt is null
+- eligible = false
+- terminal state remains stable
 
-JOB_EXECUTION_FAILED attempt=1
-JOB_RETRY_ACKNOWLEDGED nextAttempt=2
-JOB_EXECUTION_STARTED attempt=2
-JOB_EXECUTION_SUCCEEDED attempt=2
+## 11. Chaos Scenarios
 
-Expected API state:
+### CH-01 — Duplicate JOB_CREATED
 
-SUCCEEDED
+**Fault**
 
-Acceptance criteria:
+- Same eventId delivered twice
 
-completedAttempts = 2
+**Expected**
 
-attempt 1 shows FAILED
+- Only one logical event is applied
+- Version is not incremented twice for the duplicate
+- Job remains CREATED
 
-attempt 2 shows SUCCEEDED
+### CH-02 — Semantically duplicate execution with different event IDs
 
-final result is SUCCESS
+**Fault**
 
-HP-05: Retry exhausted
+- Two JOB_EXECUTION_SUCCEEDED events for the same job and attempt
+- Different eventId values
 
-Events:
+**Expected**
 
-JOB_EXECUTION_FAILED attempt=1 retryable=true
-JOB_EXECUTION_FAILED attempt=2 retryable=true
-JOB_EXECUTION_FAILED attempt=3 retryable=false
-JOB_RETRIES_EXHAUSTED
+- Final status remains SUCCEEDED
+- Attempt count does not become 2
+- Duplicate outcome is recorded as duplicate or ignored
 
-Expected API state:
+### CH-03 — Out-of-order STARTED after SUCCEEDED
 
-RETRIES_EXHAUSTED
+**Delivery order**
 
-Acceptance criteria:
+- `JOB_EXECUTION_SUCCEEDED`
+- `JOB_EXECUTION_STARTED`
 
-completedAttempts = 3
+**Expected**
 
-nextRetryAt is null
+- Final state remains SUCCEEDED
+- startedAt may be backfilled if missing
+- terminal state must not regress to RUNNING
 
-eligible = false
+### CH-04 — Scheduler acknowledgement missing
 
-terminal state remains stable
+**Events**
 
-11. Chaos Scenarios
+- `JOB_CREATED`
+- `JOB_SCHEDULER_SUBMISSION_REQUESTED`
+- No acknowledgement arrives before timeout.
 
-CH-01: Duplicate JOB_CREATED
+**Expected**
 
-Fault:
+> `PENDING_SUBMISSION`
 
-Same eventId delivered twice
+**Reconciliation finding**
 
-Expected:
+- SCHEDULER_ACK_TIMEOUT
+- The API must not return SCHEDULED.
 
-Only one logical event is applied
+### CH-05 — Scheduler acknowledged but execution EDR missing
 
-Version is not incremented twice for the duplicate
+**Events**
 
-Job remains CREATED
+- `JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED`
+- The scheduled time plus grace period passes.
 
-CH-02: Semantically duplicate execution with different event IDs
+**Expected**
 
-Fault:
+- OVERDUE
+- The API must state that no execution start was observed.
 
-Two JOB_EXECUTION_SUCCEEDED events for the same job and attempt
+### CH-06 — Execution delayed but still within grace period
 
-Different eventId values
+**Given**
 
-Expected:
+- scheduledAt has passed
+- grace period has not expired
+- no execution start EDR
 
-Final status remains SUCCEEDED
+**Expected**
 
-Attempt count does not become 2
+> `AWAITING_EXECUTION`
 
-Duplicate outcome is recorded as duplicate or ignored
+### CH-07 — Retry requested but scheduler acknowledgement missing
 
-CH-03: Out-of-order STARTED after SUCCEEDED
+**Events**
 
-Delivery order:
+- `JOB_EXECUTION_FAILED` retryable=true
+- `JOB_RETRY_REQUESTED`
 
-JOB_EXECUTION_SUCCEEDED
-JOB_EXECUTION_STARTED
+**Expected**
 
-Expected:
+> `RETRY_PENDING`
 
-Final state remains SUCCEEDED
+**Retry response**
 
-startedAt may be backfilled if missing
-
-terminal state must not regress to RUNNING
-
-CH-04: Scheduler acknowledgement missing
-
-Events:
-
-JOB_CREATED
-JOB_SCHEDULER_SUBMISSION_REQUESTED
-
-No acknowledgement arrives before timeout.
-
-Expected:
-
-PENDING_SUBMISSION
-
-Reconciliation finding:
-
-SCHEDULER_ACK_TIMEOUT
-
-The API must not return SCHEDULED.
-
-CH-05: Scheduler acknowledged but execution EDR missing
-
-Events:
-
-JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED
-
-The scheduled time plus grace period passes.
-
-Expected:
-
-OVERDUE
-
-The API must state that no execution start was observed.
-
-CH-06: Execution delayed but still within grace period
-
-Given:
-
-scheduledAt has passed
-
-grace period has not expired
-
-no execution start EDR
-
-Expected:
-
-AWAITING_EXECUTION
-
-CH-07: Retry requested but scheduler acknowledgement missing
-
-Events:
-
-JOB_EXECUTION_FAILED retryable=true
-JOB_RETRY_REQUESTED
-
-Expected:
-
-RETRY_PENDING
-
-Retry response:
-
+```json
 {
   "requested": true,
   "schedulerAcknowledged": false,
   "nextRetryAt": null
 }
+```
 
-CH-08: Retry acknowledgement arrives late
+### CH-08 — Retry acknowledgement arrives late
 
-Events:
+**Events**
 
-JOB_RETRY_REQUESTED
+- `JOB_RETRY_REQUESTED`
+- Timeout passes and reconciliation marks retry acknowledgement timeout.
 
-Timeout passes and reconciliation marks retry acknowledgement timeout.
+**Later event**
 
-Later event:
+- `JOB_RETRY_ACKNOWLEDGED`
 
-JOB_RETRY_ACKNOWLEDGED
+**Expected**
 
-Expected:
+- State transitions from RETRY_PENDING to RETRY_SCHEDULED
+- Previous timeout finding remains in audit history
+- No duplicate retry attempt is created
 
-State transitions from RETRY_PENDING to RETRY_SCHEDULED
+### CH-09 — Retry executes before retry acknowledgement EDR
 
-Previous timeout finding remains in audit history
+**Delivery order**
 
-No duplicate retry attempt is created
+- `JOB_EXECUTION_STARTED` attempt=2
+- `JOB_RETRY_ACKNOWLEDGED` nextAttempt=2
 
-CH-09: Retry executes before retry acknowledgement EDR
+**Expected**
 
-Delivery order:
+- State becomes RUNNING when attempt 2 starts
+- Late acknowledgement must not move state back to RETRY_SCHEDULED
 
-JOB_EXECUTION_STARTED attempt=2
-JOB_RETRY_ACKNOWLEDGED nextAttempt=2
+### CH-10 — EDR delivery delay
 
-Expected:
+**Fault**
 
-State becomes RUNNING when attempt 2 starts
+- EDR eventTime is correct
+- ingestionTime is 10 minutes later
 
-Late acknowledgement must not move state back to RETRY_SCHEDULED
+**Expected**
 
-CH-10: EDR delivery delay
+- State is calculated using lifecycle semantics
+- dataAsOf reflects ingestion freshness
+- processing delay is observable
 
-Fault:
+### CH-11 — EDR dropped permanently
 
-EDR eventTime is correct
+**Fault**
 
-ingestionTime is 10 minutes later
+- `JOB_EXECUTION_STARTED` is dropped
+- `JOB_EXECUTION_SUCCEEDED` is delivered
 
-Expected:
+**Expected**
 
-State is calculated using lifecycle semantics
+- Final state is SUCCEEDED
+- startedAt may remain null
+- API should expose incompleteLifecycle = true
 
-dataAsOf reflects ingestion freshness
+### CH-12 — Invalid attempt number
 
-processing delay is observable
+**Events**
 
-CH-11: EDR dropped permanently
+- `JOB_EXECUTION_FAILED` attempt=2
+- No attempt 1 exists.
 
-Fault:
+**Expected**
 
-JOB_EXECUTION_STARTED is dropped
+- Event is retained
+- Projection marks lifecycle inconsistency
+- completedAttempts must not be silently inferred as 2 without policy
+- reconciliation emits ATTEMPT_SEQUENCE_GAP
 
-JOB_EXECUTION_SUCCEEDED is delivered
+### CH-13 — Concurrent job updates
 
-Expected:
+**Fault**
 
-Final state is SUCCEEDED
+- Two projector instances update the same visibility record
 
-startedAt may remain null
+**Expected**
 
-API should expose incompleteLifecycle = true
+- Optimistic lock or conditional update rejects one writer
+- Failed writer reloads and reapplies safely
+- No event is lost
 
-CH-12: Invalid attempt number
+### CH-14 — Stale API replica
 
-Events:
+**Fault**
 
-JOB_EXECUTION_FAILED attempt=2
+- API reads from a delayed replica
 
-No attempt 1 exists.
+**Expected**
 
-Expected:
+- dataAsOf exposes stale snapshot time
+- API does not claim strong consistency
+- client can detect stale data
 
-Event is retained
+### CH-15 — Job succeeds after being marked overdue
 
-Projection marks lifecycle inconsistency
+**Events**
 
-completedAttempts must not be silently inferred as 2 without policy
+- Job becomes OVERDUE
+- Later JOB_EXECUTION_STARTED
+- Later JOB_EXECUTION_SUCCEEDED
 
-reconciliation emits ATTEMPT_SEQUENCE_GAP
+**Expected**
 
-CH-13: Concurrent job updates
+- Final state becomes SUCCEEDED
+- overdue duration is retained
+- execution delay is measurable
 
-Fault:
+### CH-16 — Late failure after success
 
-Two projector instances update the same visibility record
+**Delivery order**
 
-Expected:
+- `JOB_EXECUTION_SUCCEEDED` attempt=1
+- `JOB_EXECUTION_FAILED` attempt=1
 
-Optimistic lock or conditional update rejects one writer
+**Expected**
 
-Failed writer reloads and reapplies safely
+- Final state remains SUCCEEDED
+- conflicting terminal event is flagged
+- reconciliation emits CONFLICTING_TERMINAL_OUTCOME
 
-No event is lost
+### CH-17 — Cancelled job executes later
 
-CH-14: Stale API replica
+**Events**
 
-Fault:
+- `JOB_CANCELLED`
+- `JOB_EXECUTION_STARTED`
+- `JOB_EXECUTION_SUCCEEDED`
 
-API reads from a delayed replica
+**Expected**
 
-Expected:
+- Policy must be explicit
+- Recommended projection: final operational outcome = SUCCEEDED
+- cancellationViolation = true
+- reconciliation emits EXECUTED_AFTER_CANCEL
 
-dataAsOf exposes stale snapshot time
+### CH-18 — Retry exhausted but another attempt starts
 
-API does not claim strong consistency
+**Events**
 
-client can detect stale data
+- `JOB_RETRIES_EXHAUSTED`
+- `JOB_EXECUTION_STARTED` attempt=4
 
-CH-15: Job succeeds after being marked overdue
+**Expected**
 
-Events:
+- Lifecycle violation is recorded
+- State may become RUNNING only if observed facts take precedence
+- retriesExhaustedViolation = true
+- reconciliation emits EXECUTION_AFTER_RETRY_EXHAUSTION
 
-Job becomes OVERDUE
-
-Later JOB_EXECUTION_STARTED
-
-Later JOB_EXECUTION_SUCCEEDED
-
-Expected:
-
-Final state becomes SUCCEEDED
-
-overdue duration is retained
-
-execution delay is measurable
-
-CH-16: Late failure after success
-
-Delivery order:
-
-JOB_EXECUTION_SUCCEEDED attempt=1
-JOB_EXECUTION_FAILED attempt=1
-
-Expected:
-
-Final state remains SUCCEEDED
-
-conflicting terminal event is flagged
-
-reconciliation emits CONFLICTING_TERMINAL_OUTCOME
-
-CH-17: Cancelled job executes later
-
-Events:
-
-JOB_CANCELLED
-JOB_EXECUTION_STARTED
-JOB_EXECUTION_SUCCEEDED
-
-Expected:
-
-Policy must be explicit
-
-Recommended projection: final operational outcome = SUCCEEDED
-
-cancellationViolation = true
-
-reconciliation emits EXECUTED_AFTER_CANCEL
-
-CH-18: Retry exhausted but another attempt starts
-
-Events:
-
-JOB_RETRIES_EXHAUSTED
-JOB_EXECUTION_STARTED attempt=4
-
-Expected:
-
-Lifecycle violation is recorded
-
-State may become RUNNING only if observed facts take precedence
-
-retriesExhaustedViolation = true
-
-reconciliation emits EXECUTION_AFTER_RETRY_EXHAUSTION
-
-12. Mutable Summary EDR Behaviour
+## 12. Mutable Summary EDR Behaviour
 
 If one mutable summary EDR is used instead of fully immutable lifecycle EDRs, it must preserve:
 
-jobId
-status
-createdAt
-scheduledAt
-startedAt
-completedAt
-lastUpdatedAt
-attemptCount
-nextAttemptNumber
-maxAttempts
-lastFailureAt
-lastErrorCode
-nextRetryAt
-schedulerReference
-version
+- `jobId`
+- `status`
+- `createdAt`
+- `scheduledAt`
+- `startedAt`
+- `completedAt`
+- `lastUpdatedAt`
+- `attemptCount`
+- `nextAttemptNumber`
+- `maxAttempts`
+- `lastFailureAt`
+- `lastErrorCode`
+- `nextRetryAt`
+- `schedulerReference`
+- `version`
 
 Updates must use conditional version checks.
 
-Example:
+**Example**
 
+```sql
 UPDATE job_visibility
 SET status = :newStatus,
     completed_at = :completedAt,
     version = version + 1
 WHERE job_id = :jobId
   AND version = :expectedVersion;
+```
 
-The simulation must verify:
+**The simulation must verify**
 
-No lost update
+- No lost update
+- No timestamp deletion
+- No terminal-state regression
+- No attempt-count inflation
+- No retry acknowledgement assumption
 
-No timestamp deletion
+## 13. Assertions
 
-No terminal-state regression
+**Each scenario must assert**
 
-No attempt-count inflation
+- API status
+- recorded status
+- job version
+- attempt count
+- retry summary
+- scheduler acknowledgement state
+- scheduledAt preservation
+- startedAt preservation
+- completedAt preservation
+- dataAsOf presence
+- reconciliation findings
+- terminal-state stability
+- idempotency
 
-No retry acknowledgement assumption
+## 14. Test Data
 
-13. Assertions
+**Default job**
 
-Each scenario must assert:
-
-API status
-recorded status
-job version
-attempt count
-retry summary
-scheduler acknowledgement state
-scheduledAt preservation
-startedAt preservation
-completedAt preservation
-dataAsOf presence
-reconciliation findings
-terminal-state stability
-idempotency
-
-14. Test Data
-
-Default job
-
+```json
 {
   "jobId": "job-123",
   "correlationId": "subscription-456:RENEW:2026-07-23",
@@ -844,12 +748,18 @@ Default job
   "scheduledAt": "2026-07-23T00:00:00Z",
   "maxAttempts": 3
 }
+```
 
-Default retry policy
+**Default retry policy**
 
+```json
 {
   "maxAttempts": 3,
-  "backoffSeconds": [60, 300, 900],
+  "backoffSeconds": [
+    60,
+    300,
+    900
+  ],
   "retryableErrors": [
     "UPSTREAM_TIMEOUT",
     "TEMPORARY_UNAVAILABLE",
@@ -861,11 +771,13 @@ Default retry policy
     "BUSINESS_RULE_REJECTED"
   ]
 }
+```
 
-15. Simulation Execution Format
+## 15. Simulation Execution Format
 
-Each simulation run should produce:
+**Each simulation run should produce**
 
+```json
 {
   "scenarioId": "CH-03",
   "scenarioName": "Out-of-order STARTED after SUCCEEDED",
@@ -883,47 +795,39 @@ Each simulation run should produce:
   ],
   "result": "PASS"
 }
+```
 
-16. Success Criteria
+## 16. Success Criteria
 
-The implementation is acceptable when:
+**The implementation is acceptable when**
 
-All happy-path scenarios pass.
+- All happy-path scenarios pass.
+- Duplicate events never create duplicate attempts.
+- Out-of-order events never regress terminal state.
+- Missing scheduler acknowledgement is not represented as scheduled.
+- Missing execution evidence becomes awaiting or overdue based on time.
+- Retry requested and retry acknowledged remain distinguishable.
+- Late events can repair incomplete state without corrupting history.
+- Every API response exposes freshness.
+- Reconciliation identifies stuck, missing, conflicting, and invalid states.
+- Concurrent projection updates do not lose events.
 
-Duplicate events never create duplicate attempts.
+## 17. Recommended Minimum Scenario Set for CI
 
-Out-of-order events never regress terminal state.
+**Run on every build**
 
-Missing scheduler acknowledgement is not represented as scheduled.
-
-Missing execution evidence becomes awaiting or overdue based on time.
-
-Retry requested and retry acknowledged remain distinguishable.
-
-Late events can repair incomplete state without corrupting history.
-
-Every API response exposes freshness.
-
-Reconciliation identifies stuck, missing, conflicting, and invalid states.
-
-Concurrent projection updates do not lose events.
-
-17. Recommended Minimum Scenario Set for CI
-
-Run on every build:
-
-HP-01
-HP-02
-HP-03
-HP-04
-CH-01
-CH-03
-CH-04
-CH-05
-CH-07
-CH-09
-CH-13
-CH-15
-CH-16
+- HP-01
+- HP-02
+- HP-03
+- HP-04
+- CH-01
+- CH-03
+- CH-04
+- CH-05
+- CH-07
+- CH-09
+- CH-13
+- CH-15
+- CH-16
 
 Run the full chaos suite nightly or before production release.
