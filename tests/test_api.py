@@ -25,9 +25,28 @@ def test_edr_ingestion_and_retrieval() -> None:
 
     assert accepted.status_code == 202
     assert accepted.json()["decision"] == "APPLIED"
+    assert accepted.json()["edrType"] == "SCHEDULING"
+    assert accepted.json()["edrGroup"] == "SCHEDULING"
     assert retrieved.status_code == 200
     assert retrieved.json()["status"] == "CREATED"
     assert retrieved.json()["dataAsOf"] is not None
+
+
+def test_edr_lifecycle_is_grouped_by_type_and_requirement() -> None:
+    client = TestClient(create_app(VisibilityEngine()))
+
+    response = client.get("/edr-lifecycle")
+    items = {item["eventType"]: item for item in response.json()["items"]}
+
+    assert response.status_code == 200
+    assert items["JOB_EXECUTION_STARTED"] == {
+        "eventType": "JOB_EXECUTION_STARTED",
+        "edrType": "ATTEMPT",
+        "edrGroup": "EXECUTION",
+        "requirement": "OPTIONAL",
+    }
+    assert items["JOB_EXECUTION_SUCCEEDED"]["edrGroup"] == "TERMINAL"
+    assert items["JOB_EXECUTION_SUCCEEDED"]["requirement"] == "MANDATORY"
 
 
 def test_missing_job_response_preserves_qualified_meaning() -> None:

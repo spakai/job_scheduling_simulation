@@ -106,6 +106,7 @@ boundary.
 | --- | --- | --- |
 | Lifecycle EDR | Inbound | Record observable job facts. |
 | `POST /edrs` | Inbound | Submit one canonical EDR to the current in-memory projector. |
+| `GET /edr-lifecycle` | Outbound | Retrieve EDR type, lifecycle group, and requirement mappings. |
 | `GET /scheduled-jobs/{jobId}` | Outbound | Retrieve one business-oriented visibility record. |
 | `GET /scheduled-jobs/{jobId}/attempts` | Outbound | Retrieve observed attempt history. |
 | `GET /scheduled-jobs` | Outbound | Search by status, correlation, and scheduled range. |
@@ -419,7 +420,52 @@ Target operational metrics include eligible queue depth, oldest eligible job age
 batch size, batch saturation, poll duration, skipped polls, claim conflicts, worker wait,
 execution delay, EDR processing delay, and projection retries.
 
-### 8.6 Security and privacy
+### 8.6 Lifecycle volume, storage, and retention
+
+Lifecycle persistence intentionally stores observed facts rather than only the final result.
+For example, a scheduled job that fails three times and succeeds on its fourth attempt
+normally produces 21 EDRs:
+
+| Phase | Events per phase | EDR count |
+| --- | --- | ---: |
+| Creation | `JOB_CREATED` | 1 |
+| Initial scheduling | submission requested and acknowledged | 2 |
+| Attempts 1–3 | retrieved, started, failed, retry requested, retry acknowledged | 15 |
+| Attempt 4 | retrieved, started, succeeded | 3 |
+| **Total** |  | **21** |
+
+When optional scheduling and retrieval rows are disabled, a reduced lifecycle retaining
+attempt and retry evidence is approximately 11 EDRs. This is still materially larger than
+the single final EDR written by the current production flow, but it makes callback timing,
+individual failures, retry decisions, and eventual success auditable.
+
+The following order-of-magnitude estimates assume metadata-only EDRs. They include the
+event journal, indexes, projections, attempt summaries, and findings, but exclude large
+request or response bodies:
+
+| Completed jobs | Estimated lifecycle storage |
+| ---: | ---: |
+| 1 job | 40–125 KB |
+| 100,000 jobs | 4–12.5 GB |
+| 1 million jobs | 40–125 GB |
+| 10 million jobs | 400 GB–1.25 TB |
+
+These are capacity-planning ranges, not measured database sizes. Schema design, JSON versus
+typed columns, index selection, compression, and average field lengths must be benchmarked
+before production sizing. The target persistence design should:
+
+- Keep current job projections and attempt summaries in PostgreSQL.
+- Keep raw EDR payloads small and store large bodies in object storage via
+  `payloadReference`.
+- Retain recent raw EDRs in PostgreSQL for an agreed operational window, initially 30–90
+  days.
+- Partition `edr_events` by event date and archive older immutable partitions to compressed
+  object storage.
+- Index operational access paths such as `event_id`, `job_id`, `correlation_id`,
+  `event_time`, `edr_type`, and `edr_group`.
+- Validate retention periods against audit, privacy, deletion, and recovery requirements.
+
+### 8.7 Security and privacy
 
 The current API has no authentication or authorization and must be treated as a local
 simulation interface. A production deployment requires:

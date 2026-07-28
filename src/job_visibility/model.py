@@ -24,6 +24,75 @@ class EventType(StrEnum):
     JOB_CANCELLED = "JOB_CANCELLED"
 
 
+class EdrType(StrEnum):
+    """The state-machine row an EDR belongs to.
+
+    Scheduling EDRs describe scheduler control and always use attempt zero. Attempt
+    EDRs describe one execution/retry attempt and use a positive attempt number.
+    """
+
+    SCHEDULING = "SCHEDULING"
+    ATTEMPT = "ATTEMPT"
+
+
+class EdrGroup(StrEnum):
+    """Business grouping used to browse and report the lifecycle."""
+
+    SCHEDULING = "SCHEDULING"
+    EXECUTION = "EXECUTION"
+    RETRY = "RETRY"
+    TERMINAL = "TERMINAL"
+
+
+class EdrRequirement(StrEnum):
+    OPTIONAL = "OPTIONAL"
+    MANDATORY = "MANDATORY"
+
+
+@dataclass(frozen=True, slots=True)
+class EdrLifecycle:
+    edr_type: EdrType
+    group: EdrGroup
+    requirement: EdrRequirement
+
+
+_SCHEDULING_EVENTS = {
+    EventType.JOB_CREATED,
+    EventType.JOB_SCHEDULER_SUBMISSION_REQUESTED,
+    EventType.JOB_SCHEDULER_SUBMISSION_ACKNOWLEDGED,
+}
+_EXECUTION_EVENTS = {
+    EventType.JOB_SCHEDULER_ITEM_RETRIEVED,
+    EventType.JOB_EXECUTION_STARTED,
+}
+_RETRY_EVENTS = {
+    EventType.JOB_EXECUTION_FAILED,
+    EventType.JOB_RETRY_REQUESTED,
+    EventType.JOB_RETRY_ACKNOWLEDGED,
+}
+_SCHEDULING_TERMINAL_EVENTS = {
+    EventType.JOB_SCHEDULER_SUBMISSION_FAILED,
+    EventType.JOB_RETRY_REJECTED,
+    EventType.JOB_CANCELLED,
+}
+
+
+def classify_event(event_type: EventType) -> EdrLifecycle:
+    """Return stable lifecycle metadata for a canonical EDR event type."""
+    if event_type in _SCHEDULING_EVENTS:
+        return EdrLifecycle(EdrType.SCHEDULING, EdrGroup.SCHEDULING, EdrRequirement.OPTIONAL)
+    if event_type in _EXECUTION_EVENTS:
+        return EdrLifecycle(EdrType.ATTEMPT, EdrGroup.EXECUTION, EdrRequirement.OPTIONAL)
+    if event_type in _RETRY_EVENTS:
+        return EdrLifecycle(EdrType.ATTEMPT, EdrGroup.RETRY, EdrRequirement.OPTIONAL)
+    edr_type = (
+        EdrType.SCHEDULING
+        if event_type in _SCHEDULING_TERMINAL_EVENTS
+        else EdrType.ATTEMPT
+    )
+    return EdrLifecycle(edr_type, EdrGroup.TERMINAL, EdrRequirement.MANDATORY)
+
+
 class Status(StrEnum):
     CREATED = "CREATED"
     PENDING_SUBMISSION = "PENDING_SUBMISSION"
@@ -96,9 +165,16 @@ class Event:
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be positive")
 
+    @property
+    def lifecycle(self) -> EdrLifecycle:
+        return classify_event(self.event_type)
+
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["event_type"] = self.event_type.value
+        result["edr_type"] = self.lifecycle.edr_type.value
+        result["edr_group"] = self.lifecycle.group.value
+        result["edr_requirement"] = self.lifecycle.requirement.value
         for key in ("event_time", "ingestion_time", "scheduled_at", "next_retry_at", "poll_time"):
             result[key] = iso(result[key])
         return result

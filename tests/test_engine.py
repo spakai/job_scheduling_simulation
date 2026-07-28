@@ -3,7 +3,14 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from job_visibility.engine import VersionConflictError, VisibilityEngine
-from job_visibility.model import Event, EventType, VisibilityConfig
+from job_visibility.model import (
+    EdrGroup,
+    EdrRequirement,
+    EdrType,
+    Event,
+    EventType,
+    VisibilityConfig,
+)
 
 UTC = UTC
 NOW = datetime(2026, 7, 22, 10, 0, tzinfo=UTC)
@@ -26,6 +33,17 @@ def test_exact_duplicate_does_not_increment_version() -> None:
     engine.apply(created)
     engine.apply(created)
     assert engine.get("job-1", NOW)["version"] == 1
+
+
+def test_event_serialization_exposes_lifecycle_taxonomy() -> None:
+    failed = event(
+        "failed", EventType.JOB_EXECUTION_FAILED, attempt_number=1, retryable=True
+    )
+
+    assert failed.lifecycle.edr_type is EdrType.ATTEMPT
+    assert failed.lifecycle.group is EdrGroup.RETRY
+    assert failed.lifecycle.requirement is EdrRequirement.OPTIONAL
+    assert failed.to_dict()["edr_type"] == "ATTEMPT"
 
 
 def test_success_is_not_regressed_by_late_started() -> None:

@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from job_visibility.engine import JobNotFoundError, VisibilityEngine
-from job_visibility.model import Event, EventType, Status
+from job_visibility.model import Event, EventType, Status, classify_event
 
 
 class EventInput(BaseModel):
@@ -50,11 +50,30 @@ def create_app(engine: VisibilityEngine | None = None) -> FastAPI:
     @app.post("/edrs", status_code=202)
     def ingest_edr(value: EventInput) -> dict[str, str | None]:
         decision = visibility.apply(value.to_event())
+        lifecycle = classify_event(value.event_type)
         return {
             "eventId": decision.event_id,
             "decision": decision.decision,
             "reason": decision.reason,
+            "edrType": lifecycle.edr_type.value,
+            "edrGroup": lifecycle.group.value,
+            "edrRequirement": lifecycle.requirement.value,
         }
+
+    @app.get("/edr-lifecycle")
+    def retrieve_edr_lifecycle() -> dict[str, object]:
+        items = []
+        for event_type in EventType:
+            lifecycle = classify_event(event_type)
+            items.append(
+                {
+                    "eventType": event_type.value,
+                    "edrType": lifecycle.edr_type.value,
+                    "edrGroup": lifecycle.group.value,
+                    "requirement": lifecycle.requirement.value,
+                }
+            )
+        return {"items": items, "count": len(items)}
 
     def not_found() -> JSONResponse:
         return JSONResponse(

@@ -31,6 +31,19 @@ The arc42-aligned C4 architecture documentation is in [`architecture.md`](archit
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).
 
+## EDR lifecycle taxonomy
+
+Every canonical `eventType` is classified without requiring callers to duplicate metadata:
+
+- `edrType`: `SCHEDULING` for scheduler-control rows or `ATTEMPT` for execution rows.
+- `edrGroup`: `SCHEDULING`, `EXECUTION`, `RETRY`, or `TERMINAL`.
+- `requirement`: intermediate/configurable rows are `OPTIONAL`; terminal outcome rows are
+  `MANDATORY`.
+
+`GET /edr-lifecycle` returns the complete mapping. `POST /edrs` returns the classification
+applied to the accepted event, and serialized simulation input events include
+`edr_type`, `edr_group`, and `edr_requirement`.
+
 ## Architecture assessment
 
 The following assessment uses the four 1–10 criteria from section 7.7 of
