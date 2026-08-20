@@ -50,7 +50,7 @@ jobs:
           cache: pip
       - run: pip install -e '.[dev]'
       - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-nightly scripts/infra bootstrap
-      - run: RUN_CASSANDRA_TESTS=1 scripts/infra test-resilience
+      - run: RUN_CASSANDRA_TESTS=1 RUN_OUTAGE_TESTS=1 scripts/infra test-resilience
       - if: failure()
         run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-nightly scripts/collect-test-evidence resilience-results/nightly
       - if: failure()

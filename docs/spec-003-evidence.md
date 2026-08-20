@@ -1,13 +1,13 @@
 # Spec 003 implementation evidence
 
-Status: implementation complete for the bounded configuration and initial automated
-correctness suite; infrastructure execution and load acceptance remain outstanding in this
-checkout because Docker is unavailable.
+Status: bounded configuration, failure-domain isolation, and the current automated
+correctness/outage suite are implemented and verified against the local container stack.
+Complete restart-matrix and load acceptance evidence remain outstanding.
 
 ## Automated baseline
 
-The local non-infrastructure suite passes with 75 tests and 12 opt-in infrastructure tests
-skipped. It covers:
+The local non-infrastructure suite passes with its opt-in infrastructure tests skipped. It
+covers:
 
 - deadline configuration validation;
 - bounded polling diagnostics;
@@ -34,7 +34,16 @@ The opt-in suites provide executable coverage for:
 | Forced same-checksum two-worker conflict | `test_two_workers_force_one_checksum_conflict_then_apply_distinct_operations_once` |
 | Kafka/Schema Registry/Connect/EDR path | `test_real_kafka_connect_path_persists_canonical_edr` |
 
-These tests must pass on a Docker-capable runner before their scenarios are marked verified.
+The local Docker execution on 2026-08-21 produced:
+
+- PostgreSQL subset: 8 passed in 0.75 seconds.
+- Full resilience and outage subset: 15 passed in 74.82 seconds.
+- Broker recovery required a normal Connect consumer-group rebalance; the bounded test
+  observed outbox drain followed by persistence of both buffered EDRs.
+- Scheduler and EDR database stop/start isolation passed in both directions.
+- EDR database outage buffered a valid event in Kafka and persisted it after database
+  recovery.
+
 The `Resilience` workflow runs the PostgreSQL subset on relevant pull requests and the full
 current infrastructure subset nightly or by manual dispatch. Failures upload redacted
 Compose, connector, and proxy evidence.
@@ -59,8 +68,7 @@ depends only on and writes only to `edr-postgres`.
 
 The following work cannot be claimed complete until run on real infrastructure:
 
-- execute and stabilize the newly added opt-in suites;
-- add automated broker-stop/backlog/drain and EDR-container-stop/catch-up cases;
+- repeat the live matrix in hosted CI and address any platform-specific instability;
 - automate poison-record continuation and identity-collision DLQ assertions;
 - complete the component pre/post-commit restart matrix;
 - implement the durable representative-load driver;

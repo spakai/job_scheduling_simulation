@@ -51,6 +51,32 @@ def test_poll_timeout_reports_condition_elapsed_attempts_and_last_value() -> Non
     assert "starting" in str(raised.value)
 
 
+def test_poll_can_retry_declared_transient_exceptions() -> None:
+    fake = FakeTime()
+    attempts = 0
+
+    def observe() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise ConnectionError("dependency reconnecting")
+        return "ready"
+
+    result = poll_until(
+        observe,
+        lambda value: value == "ready",
+        description="dependency recovery",
+        timeout_seconds=1,
+        interval_seconds=0.1,
+        clock=fake.clock,
+        wait=fake.wait,
+        retry_exceptions=(ConnectionError,),
+    )
+
+    assert result == "ready"
+    assert attempts == 3
+
+
 @pytest.mark.parametrize("timeout,interval", [(0, 0.1), (1, 0)])
 def test_poll_rejects_non_positive_bounds(timeout: float, interval: float) -> None:
     with pytest.raises(ValueError):

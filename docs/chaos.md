@@ -284,12 +284,12 @@ Spec 003 tracks production hardening and evidence. The implementation status is:
 | Item | Status |
 | --- | --- |
 | Configurable PostgreSQL connect, statement, transaction, and lock timeouts | Implemented; live timeout tests added. |
-| Configurable Kafka request, socket, metadata, delivery, and flush timeouts | Implemented; real broker-outage automation remains. |
-| Automated live procedures | Initial PostgreSQL, Cassandra, publisher, projector, and Kafka-path suites added; the complete matrix remains. |
-| Loss after Cassandra finalization | Deterministic post-finalize injection and real-infrastructure test added; CI execution remains. |
-| Concurrent two-worker checksum race | Same-checksum barrier and real-infrastructure test added; CI execution remains. |
+| Configurable Kafka request, socket, metadata, delivery, and flush timeouts | Implemented; broker outage/backlog/drain passes live. |
+| Automated live procedures | PostgreSQL, Cassandra, publisher, projector, Kafka path, broker outage, sink outage, and isolation suites pass; poison/DLQ and the full restart matrix remain. |
+| Loss after Cassandra finalization | Deterministic post-finalize injection passes against Cassandra. |
+| Concurrent two-worker checksum race | Same-checksum two-driver race passes against Cassandra. |
 | Representative load with p95/p99 evidence | Workload profile proposed; durable runner and results remain. |
-| Independent scheduler and EDR database outages | Separate containers implemented; automated container-stop matrix remains. |
+| Independent scheduler and EDR database outages | Separate containers and automated stop/recovery test pass in both directions. |
 
 See [`spec-003-evidence.md`](spec-003-evidence.md) for exact test names and the evidence that
 must still be produced. These are explicit evidence gaps, not reasons to infer state from

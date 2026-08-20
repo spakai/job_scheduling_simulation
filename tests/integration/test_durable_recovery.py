@@ -37,9 +37,17 @@ def _delete_scheduler_job(engine: Engine, job_id: str) -> None:
         connection.execute(text("DELETE FROM scheduler_jobs WHERE job_id=:job"), {"job": job_id})
 
 
+def _purge_scheduler_test_data(engine: Engine) -> None:
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM scheduler_attempts WHERE job_id LIKE 'r-%'"))
+        connection.execute(text("DELETE FROM scheduler_outbox WHERE message_key LIKE 'r-%'"))
+        connection.execute(text("DELETE FROM scheduler_jobs WHERE job_id LIKE 'r-%'"))
+
+
 @pytest.mark.integration
 @pytest.mark.postgres
 def test_concurrent_pollers_claim_disjoint_jobs(scheduler_engine: Engine) -> None:
+    _purge_scheduler_test_data(scheduler_engine)
     prefix = f"r-persist-02-{uuid4()}"
     factory = _sessions(scheduler_engine)
     service = SchedulerService(factory)
@@ -94,6 +102,7 @@ def test_concurrent_pollers_claim_disjoint_jobs(scheduler_engine: Engine) -> Non
 @pytest.mark.integration
 @pytest.mark.postgres
 def test_publisher_crash_after_ack_leaves_republishable_outbox(scheduler_engine: Engine) -> None:
+    _purge_scheduler_test_data(scheduler_engine)
     event_id = f"r-kafka-01-{uuid4()}"
 
     class Producer:
@@ -171,6 +180,7 @@ def test_publisher_crash_after_ack_leaves_republishable_outbox(scheduler_engine:
 def test_sustained_retryable_failure_stops_at_exact_attempt_limit(
     scheduler_engine: Engine,
 ) -> None:
+    _purge_scheduler_test_data(scheduler_engine)
     job_id = f"r-worker-03-{uuid4()}"
     service = SchedulerService(
         _sessions(scheduler_engine), retry_delay=lambda _: timedelta(seconds=0)
@@ -206,6 +216,7 @@ def test_sustained_retryable_failure_stops_at_exact_attempt_limit(
 @pytest.mark.integration
 @pytest.mark.postgres
 def test_expired_worker_cannot_commit_over_recovered_claim(scheduler_engine: Engine) -> None:
+    _purge_scheduler_test_data(scheduler_engine)
     job_id = f"r-worker-04-{uuid4()}"
     service = SchedulerService(
         _sessions(scheduler_engine),

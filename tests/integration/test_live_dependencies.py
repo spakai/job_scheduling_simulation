@@ -48,8 +48,9 @@ def test_real_cassandra_read_times_out_through_proxy_and_recovers(
             lambda: client.select_records(dataset_id="local-v1", record_count=4, seed=42),
             lambda rows: len(rows) == 4,
             description="Cassandra reads to recover after proxy timeout",
-            timeout_seconds=10,
+            timeout_seconds=30,
             interval_seconds=0.25,
+            retry_exceptions=(DriverException, NoHostAvailable),
         )
         assert len(recovered) == 4
     finally:

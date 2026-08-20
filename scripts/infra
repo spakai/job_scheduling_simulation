@@ -104,7 +104,8 @@ case "$command_name" in
       .venv/bin/pytest -m postgres "$@"
     ;;
   test-resilience)
-    RUN_RESILIENCE_TESTS=1 SCHEDULER_DATABASE_URL=$scheduler_url EDR_DATABASE_URL=$edr_url \
+    RUN_RESILIENCE_TESTS=1 RUN_OUTAGE_TESTS=${RUN_OUTAGE_TESTS:-0} \
+      SCHEDULER_DATABASE_URL=$scheduler_url EDR_DATABASE_URL=$edr_url \
       .venv/bin/pytest -m 'integration or e2e' "$@"
     ;;
   diagnostics)
