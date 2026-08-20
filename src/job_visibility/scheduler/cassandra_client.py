@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from uuid import UUID
 
 from cassandra.cluster import Cluster, Session
@@ -15,7 +15,15 @@ from .cassandra_workload import WorkloadRecord
 class CassandraDriverClient:
     """Bounded Cassandra adapter with operation-marker reconciliation."""
 
-    def __init__(self, config: CassandraConfig, *, username: str, password: str) -> None:
+    def __init__(
+        self,
+        config: CassandraConfig,
+        *,
+        username: str,
+        password: str,
+        before_reserve: Callable[[WorkloadRecord, UUID], None] | None = None,
+        after_finalize: Callable[[WorkloadRecord, UUID], None] | None = None,
+    ) -> None:
         from cassandra.auth import PlainTextAuthProvider
 
         self.config = config
@@ -26,6 +34,8 @@ class CassandraDriverClient:
             connect_timeout=config.request_timeout_ms / 1000,
         )
         self.session: Session = self.cluster.connect(config.keyspace)
+        self.before_reserve = before_reserve
+        self.after_finalize = after_finalize
         self.session.default_timeout = config.request_timeout_ms / 1000
         self._record = self.session.prepare("""SELECT dataset_id,bucket,record_id,
             input_number,checksum,pending_operation_id,last_operation_id FROM records_by_bucket
@@ -86,6 +96,8 @@ class CassandraDriverClient:
             return True, existing
         new_checksum = record.checksum + 1
         if state.pending_operation_id != operation_id:
+            if self.before_reserve is not None:
+                self.before_reserve(record, operation_id)
             reserved = self.session.execute(
                 self._reserve,
                 (operation_id, record.dataset_id, record.bucket, record.record_id, record.checksum),
@@ -104,6 +116,8 @@ class CassandraDriverClient:
         )
         try:
             applied = self.session.execute(self._finish, values).one()
+            if self.after_finalize is not None:
+                self.after_finalize(record, operation_id)
             if not applied.applied:
                 return False, record.checksum
         except Exception:

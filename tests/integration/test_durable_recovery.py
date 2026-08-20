@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Barrier
 from uuid import uuid4
 
@@ -13,11 +13,28 @@ from sqlalchemy.orm import Session, sessionmaker
 from job_visibility.edr_store import ProjectionWorker
 from job_visibility.model import Event, EventType
 from job_visibility.outbox import BrokerCoordinate, OutboxPublisher, canonical_edr
-from job_visibility.scheduler import JobSubmission, SchedulerService
+from job_visibility.scheduler import (
+    HandlerError,
+    JobSubmission,
+    SchedulerService,
+    StaleClaimError,
+)
+from job_visibility.scheduler.models import HandlerResult
 
 
 def _sessions(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def _delete_scheduler_job(engine: Engine, job_id: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text("DELETE FROM scheduler_attempts WHERE job_id=:job"), {"job": job_id}
+        )
+        connection.execute(
+            text("DELETE FROM scheduler_outbox WHERE message_key=:job"), {"job": job_id}
+        )
+        connection.execute(text("DELETE FROM scheduler_jobs WHERE job_id=:job"), {"job": job_id})
 
 
 @pytest.mark.integration
@@ -147,6 +164,82 @@ def test_publisher_crash_after_ack_leaves_republishable_outbox(scheduler_engine:
             connection.execute(
                 text("DELETE FROM scheduler_outbox WHERE event_id=:id"), {"id": event_id}
             )
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_sustained_retryable_failure_stops_at_exact_attempt_limit(
+    scheduler_engine: Engine,
+) -> None:
+    job_id = f"r-worker-03-{uuid4()}"
+    service = SchedulerService(
+        _sessions(scheduler_engine), retry_delay=lambda _: timedelta(seconds=0)
+    )
+    service.submit(JobSubmission(job_id, job_id, "PRINT", datetime.now(UTC), {"message": "x"}))
+    failure = HandlerError("DEPENDENCY_UNAVAILABLE", "dependency unavailable", retryable=True)
+    try:
+        for attempt in range(1, 4):
+            claimed = service.claim_due(owner=f"worker-{attempt}", limit=1)
+            assert len(claimed) == 1
+            service.start(claimed[0])
+            service.fail(claimed[0], failure)
+
+        assert service.claim_due(owner="worker-4", limit=1) == []
+        with scheduler_engine.connect() as connection:
+            row = connection.execute(
+                text("""SELECT status,attempt_number,claimed_by,claim_token
+                FROM scheduler_jobs WHERE job_id=:job"""),
+                {"job": job_id},
+            ).one()
+            assert tuple(row) == ("RETRIES_EXHAUSTED", 3, None, None)
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM scheduler_attempts WHERE job_id=:job"),
+                    {"job": job_id},
+                ).scalar_one()
+                == 3
+            )
+    finally:
+        _delete_scheduler_job(scheduler_engine, job_id)
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_expired_worker_cannot_commit_over_recovered_claim(scheduler_engine: Engine) -> None:
+    job_id = f"r-worker-04-{uuid4()}"
+    service = SchedulerService(
+        _sessions(scheduler_engine),
+        claim_lease_seconds=1,
+        retry_delay=lambda _: timedelta(seconds=0),
+    )
+    service.submit(JobSubmission(job_id, job_id, "PRINT", datetime.now(UTC), {"message": "x"}))
+    old = service.claim_due(owner="old-worker", limit=1)[0]
+    service.start(old)
+    try:
+        with scheduler_engine.begin() as connection:
+            connection.execute(
+                text("""UPDATE scheduler_jobs SET claim_expires_at=clock_timestamp()-interval '1s'
+                WHERE job_id=:job"""),
+                {"job": job_id},
+            )
+        assert service.recover_expired_claims() >= 1
+        replacements = service.claim_due(owner="replacement-worker", limit=100)
+        replacement = next(job for job in replacements if job.job_id == job_id)
+
+        with pytest.raises(StaleClaimError):
+            service.succeed(old, HandlerResult({"stale": True}))
+        service.start(replacement)
+        service.succeed(replacement, HandlerResult({"recovered": True}))
+
+        with scheduler_engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT status FROM scheduler_jobs WHERE job_id=:job"), {"job": job_id}
+                ).scalar_one()
+                == "SUCCEEDED"
+            )
+    finally:
+        _delete_scheduler_job(scheduler_engine, job_id)
 
 
 @pytest.mark.integration

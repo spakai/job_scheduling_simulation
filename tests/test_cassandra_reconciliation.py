@@ -27,6 +27,8 @@ def client_with(session: object) -> CassandraDriverClient:
     client._reserve = "reserve"
     client._finish = "finish"
     client._mark = "mark"
+    client.before_reserve = None
+    client.after_finalize = None
     return client
 
 
