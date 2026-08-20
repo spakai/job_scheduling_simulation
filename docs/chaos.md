@@ -279,17 +279,18 @@ connection to scheduler, the Cassandra worker could not manage schema, and a dif
 
 ## Current gaps
 
-The architecture contains the principal failure modes, but these items should be completed
-before calling the system production-ready:
+Spec 003 tracks production hardening and evidence. The implementation status is:
 
-- Add configurable PostgreSQL connect, statement, transaction, and lock timeouts.
-- Add configurable Kafka request, socket, and delivery timeouts and a real broker-outage test.
-- Automate every live procedure above under pytest instead of relying partly on recorded
-  Phase 9 evidence.
-- Add packet-level loss after Cassandra finalization and a concurrent two-worker checksum
-  race.
-- Run load tests at representative volume and record p95/p99 freshness and throughput.
-- Run scheduler and EDR databases in separate containers for independent outage testing.
+| Item | Status |
+| --- | --- |
+| Configurable PostgreSQL connect, statement, transaction, and lock timeouts | Implemented; live timeout tests added. |
+| Configurable Kafka request, socket, metadata, delivery, and flush timeouts | Implemented; real broker-outage automation remains. |
+| Automated live procedures | Initial PostgreSQL, Cassandra, publisher, projector, and Kafka-path suites added; the complete matrix remains. |
+| Loss after Cassandra finalization | Deterministic post-finalize injection and real-infrastructure test added; CI execution remains. |
+| Concurrent two-worker checksum race | Same-checksum barrier and real-infrastructure test added; CI execution remains. |
+| Representative load with p95/p99 evidence | Workload profile proposed; durable runner and results remain. |
+| Independent scheduler and EDR database outages | Separate containers implemented; automated container-stop matrix remains. |
 
-These are explicit evidence gaps, not reasons to infer state from another subsystem or relax
-the durability boundaries.
+See [`spec-003-evidence.md`](spec-003-evidence.md) for exact test names and the evidence that
+must still be produced. These are explicit evidence gaps, not reasons to infer state from
+another subsystem or relax the durability boundaries.

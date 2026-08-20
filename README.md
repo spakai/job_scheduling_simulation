@@ -30,6 +30,8 @@ The visibility specification and implementation plan are in
 [`specs/001-scheduled-job-visibility`](specs/001-scheduled-job-visibility/). The durable
 PostgreSQL and Kafka architecture is specified in
 [`specs/002-real-persistence-kafka`](specs/002-real-persistence-kafka/).
+Production hardening, automated chaos evidence, and release gates are defined in
+[`specs/003-production-hardening-resilience`](specs/003-production-hardening-resilience/).
 The arc42-aligned C4 architecture documentation is in [`architecture.md`](architecture.md).
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).
@@ -69,6 +71,9 @@ alone. Operational recovery guidance is in
 [`docs/spec-002-runbook.md`](docs/spec-002-runbook.md).
 The failure model, discovered defects, recovery mechanisms, verified scenarios, and remaining
 chaos-test gaps are documented in [`docs/chaos.md`](docs/chaos.md).
+The bounded resilience workflow and current automation evidence are documented in
+[`docs/spec-003-runbook.md`](docs/spec-003-runbook.md) and
+[`docs/spec-003-evidence.md`](docs/spec-003-evidence.md).
 
 Inspect migration and pipeline state with:
 
