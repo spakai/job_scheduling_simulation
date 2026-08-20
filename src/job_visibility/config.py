@@ -120,6 +120,13 @@ class ReconciliationTuning(_ConfigGroup):
     interval_seconds: int = Field(default=60, ge=1)
 
 
+class ObservabilityTuning(_ConfigGroup):
+    oldest_due_seconds: int = Field(default=120, ge=1)
+    oldest_outbox_seconds: int = Field(default=60, ge=1)
+    oldest_unprojected_seconds: int = Field(default=60, ge=1)
+    dlq_growth_limit: int = Field(default=0, ge=0)
+
+
 def _logical_database(url: SecretStr) -> tuple[str, str, int | None, str]:
     """Return identity without credentials or query-string connection options."""
     parsed = urlsplit(url.get_secret_value())
@@ -139,6 +146,7 @@ class AppConfig(_ConfigGroup):
     sink: SinkTuning = Field(default_factory=SinkTuning)
     projection: ProjectionTuning = Field(default_factory=ProjectionTuning)
     reconciliation: ReconciliationTuning = Field(default_factory=ReconciliationTuning)
+    observability: ObservabilityTuning = Field(default_factory=ObservabilityTuning)
 
     @model_validator(mode="after")
     def enforce_database_ownership(self) -> Self:
@@ -251,5 +259,11 @@ class AppConfig(_ConfigGroup):
             reconciliation=ReconciliationTuning(
                 batch_size=integer("RECONCILIATION_BATCH_SIZE", 500),
                 interval_seconds=integer("RECONCILIATION_INTERVAL_SECONDS", 60),
+            ),
+            observability=ObservabilityTuning(
+                oldest_due_seconds=integer("HEALTH_OLDEST_DUE_SECONDS", 120),
+                oldest_outbox_seconds=integer("HEALTH_OLDEST_OUTBOX_SECONDS", 60),
+                oldest_unprojected_seconds=integer("HEALTH_OLDEST_UNPROJECTED_SECONDS", 60),
+                dlq_growth_limit=integer("HEALTH_DLQ_GROWTH_LIMIT", 0),
             ),
         )

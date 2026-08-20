@@ -36,20 +36,23 @@ The latest human-readable run report is in
 
 ## Spec 002 local infrastructure
 
-The durable stack uses separate `scheduler` and `edr` PostgreSQL databases, Kafka in KRaft
-mode, Schema Registry, Kafka Connect, Cassandra, and a Toxiproxy endpoint on port 9042.
+The durable stack uses physically separate scheduler and EDR PostgreSQL containers, Kafka in
+KRaft mode, Schema Registry, Kafka Connect, Cassandra, and a Toxiproxy endpoint on port 9042.
 Container tags and the JDBC connector version are pinned in `compose.yaml`.
 
 ```bash
-docker compose up -d --build
-docker compose ps --all
+scripts/infra bootstrap
 
 export SCHEDULER_DATABASE_URL='postgresql+psycopg://scheduler_owner:scheduler-local@localhost:5432/scheduler'
-export EDR_DATABASE_URL='postgresql+psycopg://edr_owner:edr-local@localhost:5432/edr'
+export EDR_DATABASE_URL='postgresql+psycopg://edr_owner:edr-local@localhost:5433/edr'
 .venv/bin/alembic -n scheduler upgrade head
 .venv/bin/alembic -n edr upgrade head
 bash infra/kafka/connect/apply.sh
 ```
+
+The bounded infrastructure interface also provides `ready`, `migrate`, `connector-apply`,
+`test-postgres`, `test-resilience`, `diagnostics`, and `down` commands. Destructive volume
+cleanup requires `CONFIRM_DELETE_TEST_VOLUMES` to exactly match the named Compose project.
 
 Run the durable background roles independently:
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -128,11 +129,13 @@ class OutboxPublisher:
         retry_initial: float = 1,
         retry_max: float = 60,
         random_source: random.Random | None = None,
+        after_ack: Callable[[OutboxRecord, BrokerCoordinate], None] | None = None,
     ) -> None:
         self.sessions, self.producer, self.owner = sessions, producer, owner
         self.batch_size, self.lease_seconds = batch_size, lease_seconds
         self.retry_initial, self.retry_max = retry_initial, retry_max
         self.random = random_source or random.Random()
+        self.after_ack = after_ack
         self.stopping = False
 
     def run_once(self) -> int:
@@ -145,6 +148,8 @@ class OutboxPublisher:
                 coordinate = self.producer.publish(
                     topic=record.topic, key=record.message_key, value=record.payload
                 )
+                if self.after_ack is not None:
+                    self.after_ack(record, coordinate)
                 self._published(record, coordinate)
                 PUBLISHED.inc()
             except Exception as exc:

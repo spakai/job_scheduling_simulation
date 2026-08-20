@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -42,8 +43,15 @@ def _time(value: str | None) -> datetime | None:
 class ProjectionWorker:
     """Projects immutable journal rows; each job is rebuilt from its authoritative EDRs."""
 
-    def __init__(self, sessions: sessionmaker[Session], *, batch_size: int = 500) -> None:
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        *,
+        batch_size: int = 500,
+        before_commit: Callable[[list[str]], None] | None = None,
+    ) -> None:
         self.sessions, self.batch_size = sessions, batch_size
+        self.before_commit = before_commit
 
     def run_once(self) -> int:
         with self.sessions.begin() as session:
@@ -65,6 +73,8 @@ class ProjectionWorker:
                     dict(item),
                 )
                 PROJECTED.inc()
+            if pending and self.before_commit is not None:
+                self.before_commit([item["event_id"] for item in pending])
             return len(pending)
 
     def rebuild(self) -> int:
