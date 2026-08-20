@@ -142,12 +142,8 @@ class AppConfig(_ConfigGroup):
                 bootstrap_servers=values.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
                 edr_topic=values.get("KAFKA_EDR_TOPIC", "job-lifecycle-edr.v1"),
                 edr_dlq_topic=values.get("KAFKA_EDR_DLQ_TOPIC", "job-lifecycle-edr-dlq.v1"),
-                consumer_group=values.get(
-                    "KAFKA_CONSUMER_GROUP", "job-visibility-projector-v1"
-                ),
-                schema_registry_url=values.get(
-                    "SCHEMA_REGISTRY_URL", "http://localhost:8081"
-                ),
+                consumer_group=values.get("KAFKA_CONSUMER_GROUP", "job-visibility-projector-v1"),
+                schema_registry_url=values.get("SCHEMA_REGISTRY_URL", "http://localhost:8081"),
             ),
             cassandra=CassandraConfig(
                 contact_points=tuple(
@@ -171,9 +167,7 @@ class AppConfig(_ConfigGroup):
                 claim_lease_seconds=integer("SCHEDULER_CLAIM_LEASE_SECONDS", 60),
             ),
             outbox=OutboxTuning(batch_size=integer("OUTBOX_BATCH_SIZE", 100)),
-            projection=ProjectionTuning(
-                batch_size=integer("PROJECTION_BATCH_SIZE", 500)
-            ),
+            projection=ProjectionTuning(batch_size=integer("PROJECTION_BATCH_SIZE", 500)),
             reconciliation=ReconciliationTuning(
                 batch_size=integer("RECONCILIATION_BATCH_SIZE", 500),
                 interval_seconds=integer("RECONCILIATION_INTERVAL_SECONDS", 60),

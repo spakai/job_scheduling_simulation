@@ -85,11 +85,7 @@ def classify_event(event_type: EventType) -> EdrLifecycle:
         return EdrLifecycle(EdrType.ATTEMPT, EdrGroup.EXECUTION, EdrRequirement.OPTIONAL)
     if event_type in _RETRY_EVENTS:
         return EdrLifecycle(EdrType.ATTEMPT, EdrGroup.RETRY, EdrRequirement.OPTIONAL)
-    edr_type = (
-        EdrType.SCHEDULING
-        if event_type in _SCHEDULING_TERMINAL_EVENTS
-        else EdrType.ATTEMPT
-    )
+    edr_type = EdrType.SCHEDULING if event_type in _SCHEDULING_TERMINAL_EVENTS else EdrType.ATTEMPT
     return EdrLifecycle(edr_type, EdrGroup.TERMINAL, EdrRequirement.MANDATORY)
 
 
