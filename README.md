@@ -64,6 +64,8 @@ is the only writer to the immutable raw EDR journal. The projector reads that jo
 updates the durable visibility tables; rebuild derives projections from the EDR database
 alone. Operational recovery guidance is in
 [`docs/spec-002-runbook.md`](docs/spec-002-runbook.md).
+The failure model, discovered defects, recovery mechanisms, verified scenarios, and remaining
+chaos-test gaps are documented in [`docs/chaos.md`](docs/chaos.md).
 
 Inspect migration and pipeline state with:
 
