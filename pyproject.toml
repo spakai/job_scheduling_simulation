@@ -8,8 +8,14 @@ version = "0.1.0"
 description = "Deterministic scheduled-job visibility and polling scheduler simulation"
 requires-python = ">=3.12"
 dependencies = [
+  "alembic>=1.16,<2",
+  "cassandra-driver>=3.29,<4",
+  "confluent-kafka[json]>=2.11,<3",
   "fastapi>=0.115,<1",
+  "prometheus-client>=0.22,<1",
+  "psycopg[binary]>=3.2,<4",
   "pydantic>=2.10,<3",
+  "sqlalchemy>=2.0,<3",
   "uvicorn>=0.34,<1",
 ]
 
@@ -22,6 +28,7 @@ dev = [
 
 [project.scripts]
 job-visibility-sim = "job_visibility.cli:main"
+job-visibility-runtime = "job_visibility.runtime:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -30,6 +37,13 @@ where = ["src"]
 addopts = "-q"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "integration: requires locally running infrastructure",
+  "kafka: requires Kafka, Schema Registry, and Kafka Connect",
+  "postgres: requires the scheduler and EDR PostgreSQL databases",
+  "cassandra: requires Cassandra and the fault proxy",
+  "e2e: requires the complete Spec 002 stack",
+]
 
 [tool.ruff]
 line-length = 100

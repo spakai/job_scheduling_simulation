@@ -40,7 +40,7 @@ class KafkaConfig(_ConfigGroup):
 class CassandraConfig(_ConfigGroup):
     contact_points: tuple[str, ...] = ("localhost",)
     port: int = Field(default=9042, ge=1, le=65535)
-    keyspace: str = "job_workload"
+    keyspace: str = "worker_demo"
     consistency: str = "LOCAL_QUORUM"
     request_timeout_ms: int = Field(default=2_000, ge=1)
     execution_timeout_ms: int = Field(default=30_000, ge=1)
@@ -77,6 +77,12 @@ class OutboxTuning(_ConfigGroup):
         return self
 
 
+class SinkTuning(_ConfigGroup):
+    batch_size: int = Field(default=500, ge=1)
+    max_retries: int = Field(default=10, ge=0)
+    retry_backoff_ms: int = Field(default=3_000, ge=1)
+
+
 class ProjectionTuning(_ConfigGroup):
     batch_size: int = Field(default=500, ge=1)
 
@@ -102,6 +108,7 @@ class AppConfig(_ConfigGroup):
     cassandra: CassandraConfig = Field(default_factory=CassandraConfig)
     scheduler: SchedulerTuning = Field(default_factory=SchedulerTuning)
     outbox: OutboxTuning = Field(default_factory=OutboxTuning)
+    sink: SinkTuning = Field(default_factory=SinkTuning)
     projection: ProjectionTuning = Field(default_factory=ProjectionTuning)
     reconciliation: ReconciliationTuning = Field(default_factory=ReconciliationTuning)
 
@@ -135,9 +142,26 @@ class AppConfig(_ConfigGroup):
             except ValueError as exc:
                 raise ConfigurationError(f"{name} must be an integer") from exc
 
+        def number(name: str, default: float) -> float:
+            raw = values.get(name)
+            if raw is None:
+                return default
+            try:
+                return float(raw)
+            except ValueError as exc:
+                raise ConfigurationError(f"{name} must be a number") from exc
+
+        def database(prefix: str) -> DatabaseConfig:
+            return DatabaseConfig(
+                url=required(f"{prefix}_DATABASE_URL"),
+                pool_size=integer(f"{prefix}_DATABASE_POOL_SIZE", 5),
+                max_overflow=integer(f"{prefix}_DATABASE_MAX_OVERFLOW", 5),
+                pool_timeout_seconds=number(f"{prefix}_DATABASE_POOL_TIMEOUT_SECONDS", 30),
+            )
+
         return cls(
-            scheduler_database=DatabaseConfig(url=required("SCHEDULER_DATABASE_URL")),
-            edr_database=DatabaseConfig(url=required("EDR_DATABASE_URL")),
+            scheduler_database=database("SCHEDULER"),
+            edr_database=database("EDR"),
             kafka=KafkaConfig(
                 bootstrap_servers=values.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
                 edr_topic=values.get("KAFKA_EDR_TOPIC", "job-lifecycle-edr.v1"),
@@ -151,7 +175,8 @@ class AppConfig(_ConfigGroup):
                     for point in values.get("CASSANDRA_CONTACT_POINTS", "localhost").split(",")
                     if point.strip()
                 ),
-                keyspace=values.get("CASSANDRA_KEYSPACE", "job_workload"),
+                port=integer("CASSANDRA_PORT", 9042),
+                keyspace=values.get("CASSANDRA_KEYSPACE", "worker_demo"),
                 consistency=values.get("CASSANDRA_CONSISTENCY", "LOCAL_QUORUM"),
                 request_timeout_ms=integer("CASSANDRA_REQUEST_TIMEOUT_MS", 2_000),
                 execution_timeout_ms=integer("CASSANDRA_EXECUTION_TIMEOUT_MS", 30_000),
@@ -166,7 +191,16 @@ class AppConfig(_ConfigGroup):
                 batch_size=integer("SCHEDULER_BATCH_SIZE", 100),
                 claim_lease_seconds=integer("SCHEDULER_CLAIM_LEASE_SECONDS", 60),
             ),
-            outbox=OutboxTuning(batch_size=integer("OUTBOX_BATCH_SIZE", 100)),
+            outbox=OutboxTuning(
+                batch_size=integer("OUTBOX_BATCH_SIZE", 100),
+                retry_initial_seconds=number("OUTBOX_RETRY_INITIAL_SECONDS", 1),
+                retry_max_seconds=number("OUTBOX_RETRY_MAX_SECONDS", 60),
+            ),
+            sink=SinkTuning(
+                batch_size=integer("SINK_BATCH_SIZE", 500),
+                max_retries=integer("SINK_MAX_RETRIES", 10),
+                retry_backoff_ms=integer("SINK_RETRY_BACKOFF_MS", 3_000),
+            ),
             projection=ProjectionTuning(batch_size=integer("PROJECTION_BATCH_SIZE", 500)),
             reconciliation=ReconciliationTuning(
                 batch_size=integer("RECONCILIATION_BATCH_SIZE", 500),

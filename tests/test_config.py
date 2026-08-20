@@ -17,6 +17,11 @@ def test_loads_role_specific_configuration_from_environment() -> None:
             "SCHEDULER_CLAIM_LEASE_SECONDS": "90",
             "CASSANDRA_CONTACT_POINTS": "cassandra-1, cassandra-2",
             "CASSANDRA_PAGE_SIZE": "250",
+            "CASSANDRA_PORT": "9142",
+            "SCHEDULER_DATABASE_POOL_SIZE": "7",
+            "EDR_DATABASE_MAX_OVERFLOW": "2",
+            "OUTBOX_RETRY_INITIAL_SECONDS": "0.25",
+            "SINK_BATCH_SIZE": "1000",
         }
     )
 
@@ -24,6 +29,11 @@ def test_loads_role_specific_configuration_from_environment() -> None:
     assert config.scheduler.claim_lease_seconds == 90
     assert config.cassandra.contact_points == ("cassandra-1", "cassandra-2")
     assert config.cassandra.page_size == 250
+    assert config.cassandra.port == 9142
+    assert config.scheduler_database.pool_size == 7
+    assert config.edr_database.max_overflow == 2
+    assert config.outbox.retry_initial_seconds == 0.25
+    assert config.sink.batch_size == 1000
 
 
 def test_rejects_same_logical_database_even_with_different_credentials() -> None:

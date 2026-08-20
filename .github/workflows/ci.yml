@@ -17,4 +17,9 @@ jobs:
       - run: ruff format --check src tests
       - run: ruff check src tests
       - run: pytest
+      - run: SCHEDULER_DATABASE_URL=postgresql+psycopg://x:x@localhost/scheduler alembic -n scheduler upgrade head --sql >/tmp/scheduler.sql
+      - run: EDR_DATABASE_URL=postgresql+psycopg://x:x@localhost/edr alembic -n edr upgrade head --sql >/tmp/edr.sql
+      - run: python -m json.tool infra/kafka/schemas/job-lifecycle-edr-v1.json >/dev/null
+      - run: python -m json.tool infra/kafka/connect/edr-jdbc-sink.json >/dev/null
+      - run: bash -n infra/kafka/setup.sh infra/kafka/connect/apply.sh infra/cassandra/setup.sh
       - run: job-visibility-sim ci --output simulation-results/ci.json

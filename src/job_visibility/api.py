@@ -4,11 +4,15 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 
+from job_visibility.edr_store import DurableVisibilityReader, KafkaEdrIngress
 from job_visibility.engine import JobNotFoundError, VisibilityEngine
 from job_visibility.model import Event, EventType, Status, classify_event
+from job_visibility.observability import HealthService
+from job_visibility.scheduler import JobSubmission, SchedulerService
 
 
 class EventInput(BaseModel):
@@ -42,19 +46,69 @@ class EventInput(BaseModel):
         return Event(**self.model_dump())
 
 
-def create_app(engine: VisibilityEngine | None = None) -> FastAPI:
+class JobSubmissionInput(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    job_id: str = Field(alias="jobId")
+    correlation_id: str = Field(alias="correlationId")
+    job_type: str = Field(alias="jobType")
+    scheduled_at: datetime = Field(alias="scheduledAt")
+    payload: dict[str, object] | None = Field(default_factory=dict)
+    payload_reference: str | None = Field(default=None, alias="payloadReference")
+    max_attempts: int = Field(default=3, ge=1, alias="maxAttempts")
+
+
+def create_app(
+    engine: VisibilityEngine | None = None,
+    scheduler: SchedulerService | None = None,
+    durable_reader: DurableVisibilityReader | None = None,
+    edr_ingress: KafkaEdrIngress | None = None,
+    health: HealthService | None = None,
+) -> FastAPI:
     visibility = engine or VisibilityEngine()
     app = FastAPI(title="Scheduled Job Visibility Simulation", version="0.1.0")
     app.state.visibility_engine = visibility
+    app.state.scheduler_service = scheduler
+
+    @app.get("/health/live")
+    def liveness() -> dict[str, str]:
+        return {"status": "alive"}
+
+    @app.get("/health/ready", response_model=None)
+    def readiness() -> dict[str, object] | JSONResponse:
+        if health is None:
+            return {"status": "ready", "mode": "simulation"}
+        ready, detail = health.check()
+        return detail if ready else JSONResponse(status_code=503, content=detail)
+
+    @app.get("/metrics")
+    def metrics() -> Response:
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    if scheduler is not None:
+
+        @app.post("/scheduler/jobs", status_code=201)
+        def submit_job(value: JobSubmissionInput) -> JSONResponse:
+            created = scheduler.submit(JobSubmission(**value.model_dump()))
+            return JSONResponse(
+                status_code=201 if created else 200,
+                content={"jobId": value.job_id, "created": created},
+            )
 
     @app.post("/edrs", status_code=202)
     def ingest_edr(value: EventInput) -> dict[str, str | None]:
-        decision = visibility.apply(value.to_event())
+        event = value.to_event()
+        if edr_ingress is not None:
+            edr_ingress.publish(event)
+            decision_values = (event.event_id, "ACCEPTED", "awaiting durable projection")
+        else:
+            decision = visibility.apply(event)
+            decision_values = (decision.event_id, decision.decision, decision.reason)
         lifecycle = classify_event(value.event_type)
         return {
-            "eventId": decision.event_id,
-            "decision": decision.decision,
-            "reason": decision.reason,
+            "eventId": decision_values[0],
+            "decision": decision_values[1],
+            "reason": decision_values[2],
             "edrType": lifecycle.edr_type.value,
             "edrGroup": lifecycle.group.value,
             "edrRequirement": lifecycle.requirement.value,
@@ -91,6 +145,8 @@ def create_app(engine: VisibilityEngine | None = None) -> FastAPI:
     @app.get("/scheduled-jobs/{job_id}", response_model=None)
     def retrieve_job(job_id: str) -> dict | JSONResponse:
         try:
+            if durable_reader is not None:
+                return durable_reader.get(job_id)
             return visibility.get(job_id, datetime.now(UTC))
         except JobNotFoundError:
             return not_found()
@@ -98,6 +154,8 @@ def create_app(engine: VisibilityEngine | None = None) -> FastAPI:
     @app.get("/scheduled-jobs/{job_id}/attempts", response_model=None)
     def retrieve_attempts(job_id: str) -> dict[str, object] | JSONResponse:
         try:
+            if durable_reader is not None:
+                return {"jobId": job_id, "attempts": durable_reader.attempts(job_id)}
             return {"jobId": job_id, "attempts": visibility.attempts(job_id)}
         except JobNotFoundError:
             return not_found()
@@ -109,17 +167,41 @@ def create_app(engine: VisibilityEngine | None = None) -> FastAPI:
         scheduled_from: Annotated[datetime | None, Query(alias="scheduledFrom")] = None,
         scheduled_to: Annotated[datetime | None, Query(alias="scheduledTo")] = None,
     ) -> dict[str, object]:
-        jobs = visibility.search(
-            datetime.now(UTC),
-            status=status,
-            correlation_id=correlation_id,
-            scheduled_from=scheduled_from,
-            scheduled_to=scheduled_to,
-        )
+        if durable_reader is not None:
+            jobs = durable_reader.search(
+                status=status.value if status else None, correlation_id=correlation_id
+            )
+            if scheduled_from:
+                jobs = [
+                    item
+                    for item in jobs
+                    if item.get("scheduledAt")
+                    and datetime.fromisoformat(item["scheduledAt"].replace("Z", "+00:00"))
+                    >= scheduled_from
+                ]
+            if scheduled_to:
+                jobs = [
+                    item
+                    for item in jobs
+                    if item.get("scheduledAt")
+                    and datetime.fromisoformat(item["scheduledAt"].replace("Z", "+00:00"))
+                    <= scheduled_to
+                ]
+        else:
+            jobs = visibility.search(
+                datetime.now(UTC),
+                status=status,
+                correlation_id=correlation_id,
+                scheduled_from=scheduled_from,
+                scheduled_to=scheduled_to,
+            )
         return {"items": jobs, "count": len(jobs)}
 
     @app.post("/reconciliation-runs")
     def reconcile() -> dict[str, object]:
+        if durable_reader is not None:
+            findings = durable_reader.findings()
+            return {"findings": findings, "count": len(findings)}
         findings = visibility.reconcile(datetime.now(UTC))
         return {"findings": [finding.to_dict() for finding in findings], "count": len(findings)}
 

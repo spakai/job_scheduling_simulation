@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from threading import RLock
 from typing import Any
@@ -26,6 +27,44 @@ class JobNotFoundError(KeyError):
 
 class VersionConflictError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ReductionResult:
+    """Complete output of one deterministic lifecycle reduction."""
+
+    job: JobVisibility
+    decision: ProjectionDecision
+
+
+def reduce_visibility(current: JobVisibility | None, event: Event) -> ReductionResult:
+    """Reduce one EDR without locks, I/O, global state, or a wall-clock read.
+
+    Exact event identity is deliberately handled by the repository checkpoint because it
+    depends on the full event journal. Semantic duplicate handling belongs here because it
+    depends only on the supplied aggregate and event.
+    """
+    job = deepcopy(current) if current is not None else JobVisibility(job_id=event.job_id)
+    if job.job_id != event.job_id:
+        raise ValueError("current projection and event must have the same job_id")
+
+    # The rule handlers below are stateless; bypassing __init__ makes that constraint
+    # explicit and ensures the pure reducer never allocates the engine's RLock or stores.
+    rules = object.__new__(VisibilityEngine)
+    if rules._is_semantic_duplicate(job, event):
+        decision = ProjectionDecision(
+            event.event_id,
+            "SEMANTIC_DUPLICATE",
+            "same outcome already observed for job attempt",
+        )
+    else:
+        decision = rules._project(job, event)
+        if decision.decision != "IGNORED":
+            job.version += 1
+    job.decisions.append(decision)
+    job.last_event_time = rules._latest(job.last_event_time, event.event_time)
+    job.data_as_of = rules._latest(job.data_as_of, event.ingestion_time)
+    return ReductionResult(job=job, decision=decision)
 
 
 class VisibilityEngine:
@@ -68,27 +107,9 @@ class VisibilityEngine:
 
             self._event_ids.add(event.event_id)
             self._events.append(event)
-            job = current or JobVisibility(job_id=event.job_id)
-            self._jobs[event.job_id] = job
-
-            if self._is_semantic_duplicate(job, event):
-                decision = ProjectionDecision(
-                    event.event_id,
-                    "SEMANTIC_DUPLICATE",
-                    "same outcome already observed for job attempt",
-                )
-                job.decisions.append(decision)
-                job.last_event_time = self._latest(job.last_event_time, event.event_time)
-                job.data_as_of = self._latest(job.data_as_of, event.ingestion_time)
-                return decision
-
-            decision = self._project(job, event)
-            job.decisions.append(decision)
-            if decision.decision != "IGNORED":
-                job.version += 1
-            job.last_event_time = self._latest(job.last_event_time, event.event_time)
-            job.data_as_of = self._latest(job.data_as_of, event.ingestion_time)
-            return decision
+            result = reduce_visibility(current, event)
+            self._jobs[event.job_id] = result.job
+            return result.decision
 
     def apply_with_retry(
         self, event: Event, expected_version: int, retries: int = 3
