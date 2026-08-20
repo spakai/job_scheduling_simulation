@@ -1,0 +1,33 @@
+{
+  "name": "edr-jdbc-sink-v1",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
+    "topics": "job-lifecycle-edr.v1",
+    "connection.url": "jdbc:postgresql://postgres:5432/edr?stringtype=unspecified",
+    "connection.user": "edr_sink",
+    "connection.password": "edr-sink-local",
+    "table.name.format": "edr_events",
+    "auto.create": "false",
+    "auto.evolve": "false",
+    "delete.enabled": "false",
+    "insert.mode": "upsert",
+    "pk.mode": "record_value",
+    "pk.fields": "event_id",
+    "fields.whitelist": "event_id,schema_version,event_type,event_time,ingestion_time,job_id,correlation_id,job_type,attempt_number,max_attempts,canonical_payload,payload_hash,kafka_topic,kafka_partition,kafka_offset",
+    "transforms": "coordinates,rename",
+    "transforms.coordinates.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.coordinates.topic.field": "kafka_topic",
+    "transforms.coordinates.partition.field": "kafka_partition",
+    "transforms.coordinates.offset.field": "kafka_offset",
+    "transforms.rename.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
+    "transforms.rename.renames": "eventId:event_id,schemaVersion:schema_version,eventType:event_type,eventTime:event_time,ingestionTime:ingestion_time,jobId:job_id,correlationId:correlation_id,jobType:job_type,attemptNumber:attempt_number,maxAttempts:max_attempts,canonicalPayload:canonical_payload,payloadHash:payload_hash",
+    "batch.size": "500",
+    "max.retries": "3",
+    "retry.backoff.ms": "1000",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "job-lifecycle-edr-dlq.v1",
+    "errors.deadletterqueue.context.headers.enable": "true",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "false"
+  }
+}

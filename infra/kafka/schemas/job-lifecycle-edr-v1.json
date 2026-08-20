@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job-lifecycle-edr-v1",
+  "title": "JobLifecycleEdrV1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schemaVersion", "eventId", "eventType", "eventTime", "ingestionTime", "jobId", "attemptNumber", "maxAttempts", "canonicalPayload", "payloadHash"],
+  "properties": {
+    "schemaVersion": {"type": "integer", "const": 1},
+    "eventId": {"type": "string", "minLength": 1},
+    "eventType": {"type": "string", "minLength": 1},
+    "eventTime": {"type": "string", "format": "date-time"},
+    "ingestionTime": {"type": "string", "format": "date-time"},
+    "jobId": {"type": "string", "minLength": 1},
+    "correlationId": {"type": ["string", "null"]},
+    "jobType": {"type": ["string", "null"]},
+    "attemptNumber": {"type": "integer", "minimum": 0},
+    "maxAttempts": {"type": "integer", "minimum": 1},
+    "canonicalPayload": {"type": "string"},
+    "payloadHash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

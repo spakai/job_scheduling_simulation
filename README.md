@@ -26,10 +26,59 @@ Start the visibility API:
 .venv/bin/uvicorn job_visibility.api:app --reload
 ```
 
-The specification and implementation plan are in [`specs/001-scheduled-job-visibility`](specs/001-scheduled-job-visibility/).
+The visibility specification and implementation plan are in
+[`specs/001-scheduled-job-visibility`](specs/001-scheduled-job-visibility/). The durable
+PostgreSQL and Kafka architecture is specified in
+[`specs/002-real-persistence-kafka`](specs/002-real-persistence-kafka/).
 The arc42-aligned C4 architecture documentation is in [`architecture.md`](architecture.md).
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).
+
+## Spec 002 local infrastructure
+
+The durable stack uses separate `scheduler` and `edr` PostgreSQL databases, Kafka in KRaft
+mode, Schema Registry, Kafka Connect, Cassandra, and a Toxiproxy endpoint on port 9042.
+Container tags and the JDBC connector version are pinned in `compose.yaml`.
+
+```bash
+docker compose up -d --build
+docker compose ps --all
+
+export SCHEDULER_DATABASE_URL='postgresql+psycopg://scheduler_owner:scheduler-local@localhost:5432/scheduler'
+export EDR_DATABASE_URL='postgresql+psycopg://edr_owner:edr-local@localhost:5432/edr'
+.venv/bin/alembic -n scheduler upgrade head
+.venv/bin/alembic -n edr upgrade head
+bash infra/kafka/connect/apply.sh
+```
+
+Run the durable background roles independently:
+
+```bash
+.venv/bin/job-visibility-runtime publisher
+.venv/bin/job-visibility-runtime projector
+.venv/bin/job-visibility-runtime rebuild --once
+```
+
+The publisher leases scheduler outbox rows and records Kafka acknowledgements. Kafka Connect
+is the only writer to the immutable raw EDR journal. The projector reads that journal and
+updates the durable visibility tables; rebuild derives projections from the EDR database
+alone. Operational recovery guidance is in
+[`docs/spec-002-runbook.md`](docs/spec-002-runbook.md).
+
+Inspect migration and pipeline state with:
+
+```bash
+.venv/bin/alembic -n scheduler current
+.venv/bin/alembic -n edr current
+curl -fsS http://localhost:8083/connectors/edr-jdbc-sink-v1/status
+docker compose exec cassandra cqlsh -u worker -p worker-local -e \
+  'SELECT * FROM worker_demo.datasets'
+```
+
+The normal unit suite never starts containers. Infrastructure tests are opt-in through the
+`integration`, `postgres`, `kafka`, `cassandra`, and `e2e` pytest markers. Stop the stack
+with `docker compose down`; use `docker compose down --volumes` only when intentionally
+discarding all local PostgreSQL, Kafka, and Cassandra data.
 
 ## EDR lifecycle taxonomy
 

@@ -36,9 +36,7 @@ def test_exact_duplicate_does_not_increment_version() -> None:
 
 
 def test_event_serialization_exposes_lifecycle_taxonomy() -> None:
-    failed = event(
-        "failed", EventType.JOB_EXECUTION_FAILED, attempt_number=1, retryable=True
-    )
+    failed = event("failed", EventType.JOB_EXECUTION_FAILED, attempt_number=1, retryable=True)
 
     assert failed.lifecycle.edr_type is EdrType.ATTEMPT
     assert failed.lifecycle.group is EdrGroup.RETRY
