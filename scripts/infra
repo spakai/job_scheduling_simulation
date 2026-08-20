@@ -45,6 +45,27 @@ ready() {
   done
 }
 
+ready_postgres() {
+  local started now scheduler_state edr_state
+  started=$(date +%s)
+  while true; do
+    scheduler_state=$(compose_cmd ps --format json scheduler-postgres 2>/dev/null || true)
+    edr_state=$(compose_cmd ps --format json edr-postgres 2>/dev/null || true)
+    if grep -q '"Health":"healthy"' <<<"$scheduler_state" &&
+      grep -q '"Health":"healthy"' <<<"$edr_state"; then
+      echo "PostgreSQL authorities ready (project=$project_name)"
+      return
+    fi
+    now=$(date +%s)
+    if (( now - started >= deadline_seconds )); then
+      echo "PostgreSQL readiness timed out after ${deadline_seconds}s" >&2
+      diagnostics
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 migrate() {
   SCHEDULER_DATABASE_URL=$scheduler_url .venv/bin/alembic -n scheduler upgrade head
   EDR_DATABASE_URL=$edr_url .venv/bin/alembic -n edr upgrade head
@@ -62,6 +83,9 @@ case "$command_name" in
     ;;
   ready)
     ready
+    ;;
+  ready-postgres)
+    ready_postgres
     ;;
   migrate)
     migrate
@@ -97,6 +121,6 @@ case "$command_name" in
     compose_cmd down --volumes --remove-orphans
     ;;
   help|*)
-    echo "usage: scripts/infra {up|ready|migrate|connector-apply|bootstrap|test-postgres|test-resilience|diagnostics|down|down-volumes}"
+    echo "usage: scripts/infra {up|ready|ready-postgres|migrate|connector-apply|bootstrap|test-postgres|test-resilience|diagnostics|down|down-volumes}"
     ;;
 esac

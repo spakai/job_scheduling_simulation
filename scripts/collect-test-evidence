@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+output_dir=${1:-resilience-results/current}
+project_name=${JOB_VISIBILITY_COMPOSE_PROJECT:-job-visibility-resilience}
+mkdir -p "$output_dir"
+
+sanitize() {
+  sed -E \
+    -e 's#(password|passwd|secret)(["=: ]+)[^ ,"}]+#\1\2[REDACTED]#Ig' \
+    -e 's#(postgresql[^: ]*://[^: ]+:)[^@ ]+@#\1[REDACTED]@#g'
+}
+
+{
+  echo "commit=$(git rev-parse HEAD)"
+  echo "collected_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "compose_project=$project_name"
+} >"$output_dir/manifest.txt"
+
+if command -v docker >/dev/null 2>&1; then
+  docker compose --project-name "$project_name" ps --all 2>&1 |
+    sanitize >"$output_dir/compose-ps.txt" || true
+  docker compose --project-name "$project_name" logs --no-color --timestamps 2>&1 |
+    sanitize >"$output_dir/compose.log" || true
+fi
+
+curl -fsS http://localhost:8083/connectors/edr-jdbc-sink-v1/status 2>&1 |
+  sanitize >"$output_dir/connector-status.json" || true
+curl -fsS http://localhost:8474/proxies 2>&1 |
+  sanitize >"$output_dir/toxiproxy.json" || true

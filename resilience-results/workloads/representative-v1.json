@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "name": "representative-v1",
+  "status": "proposed",
+  "durationSeconds": 900,
+  "warmupSeconds": 60,
+  "arrivalPattern": {
+    "type": "constant",
+    "jobsPerSecond": 25
+  },
+  "jobMix": {
+    "PRINT": 0.55,
+    "FIBONACCI": 0.35,
+    "CASSANDRA_FIB_UPDATE": 0.1
+  },
+  "payloadBytes": {
+    "p50": 512,
+    "p95": 4096,
+    "maximum": 16384
+  },
+  "scheduler": {
+    "pollers": 4,
+    "batchSize": 100
+  },
+  "workers": {
+    "concurrency": 16
+  },
+  "cassandra": {
+    "recordCount": 10000,
+    "seed": 42,
+    "pageSize": 500,
+    "processingDelayMs": 100
+  },
+  "objectives": {
+    "healthyFreshnessPercentile": 95,
+    "healthyFreshnessMaximumSeconds": 10,
+    "brokerOutageSeconds": 60,
+    "brokerRecoveryMaximumSeconds": 300
+  },
+  "requiredMeasurements": [
+    "schedulerClaimThroughput",
+    "oldestDueAge",
+    "outboxThroughput",
+    "oldestUnpublishedAge",
+    "kafkaLag",
+    "projectionLatency",
+    "apiLatencyP50",
+    "apiLatencyP95",
+    "apiLatencyP99",
+    "freshnessP50",
+    "freshnessP95",
+    "freshnessP99",
+    "backlogDrainRate",
+    "cassandraRequestP95",
+    "cassandraRequestP99",
+    "workerMemoryBytes"
+  ]
+}
