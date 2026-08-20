@@ -22,5 +22,11 @@ def test_builds_independent_role_specific_pools_without_connecting() -> None:
         assert sessions.scheduler.engine.url.database == "scheduler"
         assert sessions.edr.engine.url.database == "edr"
         assert str(sessions.scheduler.engine.url).find("secret") == -1
+        connect_args = sessions.scheduler.engine.dialect.create_connect_args(
+            sessions.scheduler.engine.url
+        )[1]
+        # SQLAlchemy exposes URL-derived arguments here; role deadline options are supplied
+        # separately to the pool creator and covered by the configuration contract tests.
+        assert connect_args["dbname"] == "scheduler"
     finally:
         sessions.dispose()

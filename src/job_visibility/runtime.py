@@ -21,6 +21,16 @@ def main() -> None:
             producer = ConfluentBrokerProducer(
                 config.kafka.bootstrap_servers,
                 schema_registry_url=config.kafka.schema_registry_url,
+                socket_timeout_ms=config.kafka.socket_timeout_ms,
+                request_timeout_ms=config.kafka.request_timeout_ms,
+                delivery_timeout_ms=config.kafka.delivery_timeout_ms,
+                metadata_timeout_ms=config.kafka.metadata_timeout_ms,
+                schema_registry_connect_timeout_seconds=(
+                    config.kafka.schema_registry_connect_timeout_seconds
+                ),
+                schema_registry_read_timeout_seconds=(
+                    config.kafka.schema_registry_read_timeout_seconds
+                ),
             )
             worker = OutboxPublisher(
                 sessions.scheduler.session_factory,
@@ -45,7 +55,7 @@ def main() -> None:
                 time.sleep(0.5)
     except KeyboardInterrupt:
         if args.role == "publisher":
-            worker.stop()  # type: ignore[union-attr]
+            worker.stop(config.kafka.flush_timeout_seconds)  # type: ignore[union-attr]
     finally:
         sessions.dispose()
 

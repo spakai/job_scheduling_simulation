@@ -27,6 +27,19 @@ class DatabaseConfig(_ConfigGroup):
     pool_size: int = Field(default=5, ge=1)
     max_overflow: int = Field(default=5, ge=0)
     pool_timeout_seconds: float = Field(default=30, gt=0)
+    connect_timeout_seconds: int = Field(default=5, ge=1)
+    statement_timeout_ms: int = Field(default=15_000, ge=1)
+    lock_timeout_ms: int = Field(default=5_000, ge=1)
+    idle_transaction_timeout_ms: int = Field(default=30_000, ge=1)
+    transaction_timeout_ms: int = Field(default=30_000, ge=1)
+
+    @model_validator(mode="after")
+    def validate_deadlines(self) -> Self:
+        if self.lock_timeout_ms > self.statement_timeout_ms:
+            raise ValueError("database lock timeout cannot exceed statement timeout")
+        if self.statement_timeout_ms > self.transaction_timeout_ms:
+            raise ValueError("database statement timeout cannot exceed transaction timeout")
+        return self
 
 
 class KafkaConfig(_ConfigGroup):
@@ -35,6 +48,21 @@ class KafkaConfig(_ConfigGroup):
     edr_dlq_topic: str = "job-lifecycle-edr-dlq.v1"
     consumer_group: str = "job-visibility-projector-v1"
     schema_registry_url: str = "http://localhost:8081"
+    socket_timeout_ms: int = Field(default=10_000, ge=1)
+    request_timeout_ms: int = Field(default=10_000, ge=1)
+    delivery_timeout_ms: int = Field(default=30_000, ge=1)
+    metadata_timeout_ms: int = Field(default=10_000, ge=1)
+    flush_timeout_seconds: float = Field(default=10, gt=0)
+    schema_registry_connect_timeout_seconds: float = Field(default=5, gt=0)
+    schema_registry_read_timeout_seconds: float = Field(default=10, gt=0)
+
+    @model_validator(mode="after")
+    def validate_deadlines(self) -> Self:
+        if self.request_timeout_ms > self.delivery_timeout_ms:
+            raise ValueError("Kafka request timeout cannot exceed delivery timeout")
+        if self.flush_timeout_seconds * 1_000 > self.delivery_timeout_ms:
+            raise ValueError("Kafka flush timeout cannot exceed delivery timeout")
+        return self
 
 
 class CassandraConfig(_ConfigGroup):
@@ -157,6 +185,13 @@ class AppConfig(_ConfigGroup):
                 pool_size=integer(f"{prefix}_DATABASE_POOL_SIZE", 5),
                 max_overflow=integer(f"{prefix}_DATABASE_MAX_OVERFLOW", 5),
                 pool_timeout_seconds=number(f"{prefix}_DATABASE_POOL_TIMEOUT_SECONDS", 30),
+                connect_timeout_seconds=integer(f"{prefix}_DATABASE_CONNECT_TIMEOUT_SECONDS", 5),
+                statement_timeout_ms=integer(f"{prefix}_DATABASE_STATEMENT_TIMEOUT_MS", 15_000),
+                lock_timeout_ms=integer(f"{prefix}_DATABASE_LOCK_TIMEOUT_MS", 5_000),
+                idle_transaction_timeout_ms=integer(
+                    f"{prefix}_DATABASE_IDLE_TRANSACTION_TIMEOUT_MS", 30_000
+                ),
+                transaction_timeout_ms=integer(f"{prefix}_DATABASE_TRANSACTION_TIMEOUT_MS", 30_000),
             )
 
         return cls(
@@ -168,6 +203,17 @@ class AppConfig(_ConfigGroup):
                 edr_dlq_topic=values.get("KAFKA_EDR_DLQ_TOPIC", "job-lifecycle-edr-dlq.v1"),
                 consumer_group=values.get("KAFKA_CONSUMER_GROUP", "job-visibility-projector-v1"),
                 schema_registry_url=values.get("SCHEMA_REGISTRY_URL", "http://localhost:8081"),
+                socket_timeout_ms=integer("KAFKA_SOCKET_TIMEOUT_MS", 10_000),
+                request_timeout_ms=integer("KAFKA_REQUEST_TIMEOUT_MS", 10_000),
+                delivery_timeout_ms=integer("KAFKA_DELIVERY_TIMEOUT_MS", 30_000),
+                metadata_timeout_ms=integer("KAFKA_METADATA_TIMEOUT_MS", 10_000),
+                flush_timeout_seconds=number("KAFKA_FLUSH_TIMEOUT_SECONDS", 10),
+                schema_registry_connect_timeout_seconds=number(
+                    "SCHEMA_REGISTRY_CONNECT_TIMEOUT_SECONDS", 5
+                ),
+                schema_registry_read_timeout_seconds=number(
+                    "SCHEMA_REGISTRY_READ_TIMEOUT_SECONDS", 10
+                ),
             ),
             cassandra=CassandraConfig(
                 contact_points=tuple(
