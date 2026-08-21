@@ -18,6 +18,7 @@ from job_visibility.scheduler import (
     JobSubmission,
     SchedulerService,
     StaleClaimError,
+    SubmissionDecision,
 )
 from job_visibility.scheduler.models import HandlerResult
 
@@ -42,6 +43,49 @@ def _purge_scheduler_test_data(engine: Engine) -> None:
         connection.execute(text("DELETE FROM scheduler_attempts WHERE job_id LIKE 'r-%'"))
         connection.execute(text("DELETE FROM scheduler_outbox WHERE message_key LIKE 'r-%'"))
         connection.execute(text("DELETE FROM scheduler_jobs WHERE job_id LIKE 'r-%'"))
+
+
+@pytest.mark.integration
+@pytest.mark.postgres
+def test_submission_replay_is_idempotent_and_conflict_is_rejected(
+    scheduler_engine: Engine,
+) -> None:
+    job_id = f"r-api-04-{uuid4()}"
+    service = SchedulerService(_sessions(scheduler_engine))
+    original = JobSubmission(
+        job_id,
+        "correlation-original",
+        "FIBONACCI",
+        datetime.now(UTC),
+        {"limit": 100},
+    )
+    conflict = JobSubmission(
+        job_id,
+        "correlation-original",
+        "FIBONACCI",
+        original.scheduled_at,
+        {"limit": 101},
+    )
+    try:
+        assert service.submit_checked(original) is SubmissionDecision.CREATED
+        assert service.submit_checked(original) is SubmissionDecision.IDENTICAL
+        assert service.submit_checked(conflict) is SubmissionDecision.CONFLICT
+        with scheduler_engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM scheduler_jobs WHERE job_id=:job"), {"job": job_id}
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM scheduler_outbox WHERE message_key=:job"),
+                    {"job": job_id},
+                ).scalar_one()
+                == 2
+            )
+    finally:
+        _delete_scheduler_job(scheduler_engine, job_id)
 
 
 @pytest.mark.integration

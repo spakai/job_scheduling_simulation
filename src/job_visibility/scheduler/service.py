@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -18,6 +19,12 @@ from .models import ClaimedJob, HandlerResult, JobSubmission
 
 class StaleClaimError(RuntimeError):
     pass
+
+
+class SubmissionDecision(StrEnum):
+    CREATED = "CREATED"
+    IDENTICAL = "IDENTICAL"
+    CONFLICT = "CONFLICT"
 
 
 class SchedulerService:
@@ -37,6 +44,9 @@ class SchedulerService:
         self.handlers = handlers or HandlerRegistry()
 
     def submit(self, value: JobSubmission) -> bool:
+        return self.submit_checked(value) is SubmissionDecision.CREATED
+
+    def submit_checked(self, value: JobSubmission) -> SubmissionDecision:
         with self.sessions.begin() as session:
             inserted = session.execute(
                 text("""
@@ -58,11 +68,29 @@ class SchedulerService:
                 },
             ).scalar_one_or_none()
             if inserted is None:
-                return False
+                existing = (
+                    session.execute(
+                        text("""SELECT correlation_id,job_type,payload,payload_reference,
+                    scheduled_at,max_attempts FROM scheduler_jobs WHERE job_id=:job_id"""),
+                        {"job_id": value.job_id},
+                    )
+                    .mappings()
+                    .one()
+                )
+                expected_payload = value.payload if value.payload is not None else None
+                identical = (
+                    existing["correlation_id"] == value.correlation_id
+                    and existing["job_type"] == value.job_type
+                    and existing["payload"] == expected_payload
+                    and existing["payload_reference"] == value.payload_reference
+                    and existing["scheduled_at"] == value.scheduled_at
+                    and existing["max_attempts"] == value.max_attempts
+                )
+                return SubmissionDecision.IDENTICAL if identical else SubmissionDecision.CONFLICT
             common = self._event_values(value, inserted)
             self._add_event(session, EventType.JOB_CREATED, **common)
             self._add_event(session, EventType.JOB_SCHEDULER_SUBMISSION_REQUESTED, **common)
-            return True
+            return SubmissionDecision.CREATED
 
     def claim_due(self, *, owner: str, limit: int) -> list[ClaimedJob]:
         if limit < 1:

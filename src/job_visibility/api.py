@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import SQLAlchemyError
 
 from job_visibility.edr_store import DurableVisibilityReader, KafkaEdrIngress
 from job_visibility.engine import JobNotFoundError, VisibilityEngine
 from job_visibility.model import Event, EventType, Status, classify_event
 from job_visibility.observability import HealthService
-from job_visibility.scheduler import JobSubmission, SchedulerService
+from job_visibility.scheduler import JobSubmission, SchedulerService, SubmissionDecision
 
 
 class EventInput(BaseModel):
@@ -64,9 +66,13 @@ def create_app(
     durable_reader: DurableVisibilityReader | None = None,
     edr_ingress: KafkaEdrIngress | None = None,
     health: HealthService | None = None,
+    *,
+    lifespan: Any = None,
+    max_payload_bytes: int = 65_536,
+    visibility_base_url: str = "",
 ) -> FastAPI:
     visibility = engine or VisibilityEngine()
-    app = FastAPI(title="Scheduled Job Visibility Simulation", version="0.1.0")
+    app = FastAPI(title="Scheduled Job Visibility Simulation", version="0.1.0", lifespan=lifespan)
     app.state.visibility_engine = visibility
     app.state.scheduler_service = scheduler
 
@@ -89,10 +95,39 @@ def create_app(
 
         @app.post("/scheduler/jobs", status_code=201)
         def submit_job(value: JobSubmissionInput) -> JSONResponse:
-            created = scheduler.submit(JobSubmission(**value.model_dump()))
+            if value.job_type not in {"PRINT", "FIBONACCI"}:
+                return JSONResponse(
+                    status_code=422,
+                    content={"code": "UNSUPPORTED_JOB_TYPE", "jobType": value.job_type},
+                )
+            payload_size = len(json.dumps(value.payload, separators=(",", ":")).encode())
+            if payload_size > max_payload_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content={"code": "JOB_PAYLOAD_TOO_LARGE", "limitBytes": max_payload_bytes},
+                )
+            try:
+                decision = scheduler.submit_checked(JobSubmission(**value.model_dump()))
+            except SQLAlchemyError:
+                return JSONResponse(
+                    status_code=503,
+                    content={"code": "SCHEDULER_DATABASE_UNAVAILABLE"},
+                )
+            if decision is SubmissionDecision.CONFLICT:
+                return JSONResponse(
+                    status_code=409,
+                    content={"code": "JOB_ID_CONFLICT", "jobId": value.job_id},
+                )
+            created = decision is SubmissionDecision.CREATED
             return JSONResponse(
                 status_code=201 if created else 200,
-                content={"jobId": value.job_id, "created": created},
+                content={
+                    "jobId": value.job_id,
+                    "created": created,
+                    "statusUrl": (
+                        f"{visibility_base_url.rstrip('/')}/scheduled-jobs/{value.job_id}"
+                    ),
+                },
             )
 
     @app.post("/edrs", status_code=202)

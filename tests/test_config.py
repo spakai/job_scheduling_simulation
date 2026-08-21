@@ -1,7 +1,12 @@
 import pytest
 from pydantic import ValidationError
 
-from job_visibility.config import AppConfig, ConfigurationError
+from job_visibility.config import (
+    AppConfig,
+    ConfigurationError,
+    database_config_from_env,
+    scheduler_tuning_from_env,
+)
 
 BASE_ENV = {
     "SCHEDULER_DATABASE_URL": "postgresql+psycopg://scheduler:secret@db:5432/scheduler",
@@ -109,3 +114,19 @@ def test_database_passwords_are_redacted_from_repr() -> None:
 
     assert "secret" not in repr(config)
     assert "other-secret" not in repr(config)
+
+
+def test_role_specific_loaders_do_not_require_the_other_database() -> None:
+    scheduler_database = database_config_from_env(
+        "SCHEDULER", {"SCHEDULER_DATABASE_URL": BASE_ENV["SCHEDULER_DATABASE_URL"]}
+    )
+    tuning = scheduler_tuning_from_env(
+        {
+            "SCHEDULER_POLL_INTERVAL_SECONDS": "0.25",
+            "SCHEDULER_RECOVERY_BATCH_SIZE": "17",
+        }
+    )
+
+    assert scheduler_database.url.get_secret_value() == BASE_ENV["SCHEDULER_DATABASE_URL"]
+    assert tuning.poll_interval_seconds == 0.25
+    assert tuning.recovery_batch_size == 17

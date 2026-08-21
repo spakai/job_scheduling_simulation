@@ -5,6 +5,7 @@ command_name=${1:-help}
 shift || true
 project_name=${JOB_VISIBILITY_COMPOSE_PROJECT:-job-visibility-resilience}
 compose=(docker compose --project-name "$project_name")
+compose_apps=(docker compose --project-name "$project_name" --profile apps)
 scheduler_url=${SCHEDULER_DATABASE_URL:-postgresql+psycopg://scheduler_owner:scheduler-local@localhost:5432/scheduler}
 edr_url=${EDR_DATABASE_URL:-postgresql+psycopg://edr_owner:edr-local@localhost:5433/edr}
 deadline_seconds=${INFRA_READY_TIMEOUT_SECONDS:-300}
@@ -77,12 +78,35 @@ ready_postgres() {
 migrate() {
   SCHEDULER_DATABASE_URL=$scheduler_url "$python_command" -m alembic -n scheduler upgrade head
   EDR_DATABASE_URL=$edr_url "$python_command" -m alembic -n edr upgrade head
+  compose_cmd exec -T edr-postgres psql -U postgres -d edr < infra/postgres/edr-reader.sql
+}
+
+ready_apps() {
+  require_command curl
+  local started now
+  started=$(date +%s)
+  while true; do
+    if curl -fsS http://localhost:8000/health/ready >/dev/null 2>&1 &&
+      curl -fsS http://localhost:8001/health/ready >/dev/null 2>&1; then
+      echo "application roles ready (project=$project_name)"
+      return
+    fi
+    now=$(date +%s)
+    if (( now - started >= deadline_seconds )); then
+      echo "application readiness timed out after ${deadline_seconds}s" >&2
+      diagnostics
+      return 1
+    fi
+    sleep 2
+  done
 }
 
 diagnostics() {
-  compose_cmd ps --all || true
+  "${compose_apps[@]}" ps --all || true
   curl -fsS http://localhost:8083/connectors/edr-jdbc-sink-v1/status || true
   curl -fsS http://localhost:8474/proxies || true
+  curl -fsS http://localhost:8000/health/ready || true
+  curl -fsS http://localhost:8001/health/ready || true
 }
 
 case "$command_name" in
@@ -107,6 +131,17 @@ case "$command_name" in
     migrate
     bash infra/kafka/connect/apply.sh
     ;;
+  up-apps)
+    "${compose_apps[@]}" up -d --build scheduler-api visibility-api scheduler-worker \
+      outbox-publisher projector
+    ready_apps
+    ;;
+  ready-apps)
+    ready_apps
+    ;;
+  smoke-http)
+    bash scripts/http-smoke
+    ;;
   test-postgres)
     RUN_POSTGRES_TESTS=1 SCHEDULER_DATABASE_URL=$scheduler_url EDR_DATABASE_URL=$edr_url \
       "$python_command" -m pytest -m postgres "$@"
@@ -120,16 +155,16 @@ case "$command_name" in
     diagnostics
     ;;
   down)
-    compose_cmd down --remove-orphans
+    "${compose_apps[@]}" down --remove-orphans
     ;;
   down-volumes)
     if [[ ${CONFIRM_DELETE_TEST_VOLUMES:-} != "$project_name" ]]; then
       echo "refusing volume deletion; set CONFIRM_DELETE_TEST_VOLUMES=$project_name" >&2
       exit 2
     fi
-    compose_cmd down --volumes --remove-orphans
+    "${compose_apps[@]}" down --volumes --remove-orphans
     ;;
   help|*)
-    echo "usage: scripts/infra {up|ready|ready-postgres|migrate|connector-apply|bootstrap|test-postgres|test-resilience|diagnostics|down|down-volumes}"
+    echo "usage: scripts/infra {up|ready|ready-postgres|migrate|connector-apply|bootstrap|up-apps|ready-apps|smoke-http|test-postgres|test-resilience|diagnostics|down|down-volumes}"
     ;;
 esac

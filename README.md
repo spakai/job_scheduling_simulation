@@ -32,6 +32,8 @@ PostgreSQL and Kafka architecture is specified in
 [`specs/002-real-persistence-kafka`](specs/002-real-persistence-kafka/).
 Production hardening, automated chaos evidence, and release gates are defined in
 [`specs/003-production-hardening-resilience`](specs/003-production-hardening-resilience/).
+Production API composition and the standalone scheduler runtime are specified in
+[`specs/004-production-api-runtime`](specs/004-production-api-runtime/).
 The arc42-aligned C4 architecture documentation is in [`architecture.md`](architecture.md).
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).
@@ -64,6 +66,47 @@ Run the durable background roles independently:
 .venv/bin/job-visibility-runtime rebuild --once
 ```
 
+## Production-like HTTP path
+
+Start the infrastructure, migrations/connector, and role-isolated application services:
+
+```bash
+scripts/infra bootstrap
+scripts/infra up-apps
+scripts/infra smoke-http
+```
+
+The scheduler API listens on port 8000 and owns only scheduler PostgreSQL access. The
+visibility API listens on port 8001 and reads only EDR PostgreSQL projections. The apps
+profile also starts the scheduler worker, outbox publisher, and projector.
+
+Submit a job directly:
+
+```bash
+curl -X POST http://localhost:8000/scheduler/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jobId":"example-fibonacci-1",
+    "correlationId":"example-order-1",
+    "jobType":"FIBONACCI",
+    "scheduledAt":"2026-08-21T12:00:00Z",
+    "payload":{"limit":10000},
+    "maxAttempts":3
+  }'
+```
+
+Read its EDR-derived projection and attempts independently:
+
+```bash
+curl http://localhost:8001/scheduled-jobs/example-fibonacci-1
+curl http://localhost:8001/scheduled-jobs/example-fibonacci-1/attempts
+curl 'http://localhost:8001/scheduled-jobs?correlationId=example-order-1'
+```
+
+For host-managed processes, use `job-visibility-api scheduler`,
+`job-visibility-api visibility`, and `job-visibility-runtime scheduler`. The original
+`uvicorn job_visibility.api:app` command remains the in-memory simulation API.
+
 The publisher leases scheduler outbox rows and records Kafka acknowledgements. Kafka Connect
 is the only writer to the immutable raw EDR journal. The projector reads that journal and
 updates the durable visibility tables; rebuild derives projections from the EDR database
@@ -74,6 +117,8 @@ chaos-test gaps are documented in [`docs/chaos.md`](docs/chaos.md).
 The bounded resilience workflow and current automation evidence are documented in
 [`docs/spec-003-runbook.md`](docs/spec-003-runbook.md) and
 [`docs/spec-003-evidence.md`](docs/spec-003-evidence.md).
+The production HTTP operating procedure is in
+[`docs/spec-004-runbook.md`](docs/spec-004-runbook.md).
 
 Inspect migration and pipeline state with:
 

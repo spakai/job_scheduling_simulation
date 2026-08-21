@@ -29,6 +29,7 @@ dev = [
 [project.scripts]
 job-visibility-sim = "job_visibility.cli:main"
 job-visibility-runtime = "job_visibility.runtime:main"
+job-visibility-api = "job_visibility.production_api:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

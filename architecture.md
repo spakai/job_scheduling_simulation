@@ -1,12 +1,11 @@
-# Scheduled Job Visibility Simulation Architecture
+# Scheduled Job Scheduling and Visibility Architecture
 
-Status: current implementation plus production target
-Last updated: 2026-07-22
+Status: current implementation through Spec 004
+Last updated: 2026-08-21
 
 This document uses the arc42 structure for architectural concerns and C4-style views for
-system context, containers, components, and deployment. It distinguishes implemented
-behavior from the production architecture proposed in
-[`plan.md`](specs/001-scheduled-job-visibility/plan.md).
+system context, containers, components, and deployment. It covers the deterministic
+simulation and the durable production-like runtime delivered by Specs 002–004.
 
 ## 1. Introduction and goals
 
@@ -23,6 +22,8 @@ The implementation is both:
   scenarios.
 - A reference visibility projection that consumes lifecycle EDRs and exposes business
   state through an HTTP API.
+- A durable scheduler, worker, event-delivery pipeline, and role-isolated production HTTP
+  topology backed by PostgreSQL, Kafka, Kafka Connect, and optional Cassandra handlers.
 
 ### 1.2 Architectural goals
 
@@ -33,7 +34,7 @@ The implementation is both:
 | 3 | Deterministic validation | A virtual clock and declarative scenarios avoid wall-clock sleeps and nondeterministic tests. |
 | 4 | Idempotency | Exact event IDs and semantic attempt outcomes are deduplicated. |
 | 5 | Safe ordering | Late events may backfill evidence but cannot incorrectly regress terminal state. |
-| 6 | Concurrency safety | Version checks reject stale writers; the target persistence layer uses transactional conditional updates. |
+| 6 | Concurrency safety | Version checks reject stale writers; durable stores use transactional and conditional updates. |
 | 7 | Operational visibility | API responses expose `dataAsOf`, processing delay, version, findings, and lifecycle-quality flags. |
 
 ### 1.3 Stakeholders
@@ -51,8 +52,9 @@ The implementation is both:
 
 ### 2.1 Business and integration constraints
 
-- The external scheduler is outside the visibility system's control.
-- The scheduler polls once every 60 seconds.
+- The deterministic simulator models an external scheduler; the durable runtime includes a
+  bounded polling scheduler worker.
+- Poll cadence is configurable and finite; simulation scenarios commonly use 60 seconds.
 - Each poll retrieves at most `X` eligible jobs.
 - EDRs are the authoritative integration evidence.
 - Missing evidence must not be replaced with an assertion about scheduler state.
@@ -63,10 +65,13 @@ The implementation is both:
 
 - Python 3.12 or newer.
 - FastAPI and Pydantic provide the implemented HTTP boundary.
-- Tests must use virtual time rather than real sleeps.
-- The current implementation is in-memory and single-process.
-- PostgreSQL, durable EDR transport, and independently scalable services are target-state
-  elements and are not yet implemented.
+- Simulation tests use virtual time. Infrastructure and recovery tests use bounded
+  condition polling against real services.
+- The simulation remains in-memory and isolated by process.
+- The durable runtime uses separate scheduler and EDR PostgreSQL authorities, Kafka with
+  Schema Registry, Kafka Connect, and independently runnable API/worker roles.
+- Production scheduler and visibility APIs must not receive each other's database
+  credentials.
 
 ### 2.3 Conventions
 
@@ -85,33 +90,35 @@ flowchart LR
     testAuthor["Person: Test author"]
     apiClient["Person: Visibility API client"]
     jobProducer["External system: Job producer"]
-    scheduler["External system: Polling scheduler"]
-    visibility["Software system: Job visibility simulation"]
+    scheduler["Software system: Durable polling scheduler"]
+    visibility["Software system: Job scheduling and visibility"]
 
     testAuthor -->|"Defines and runs scenarios"| visibility
     apiClient -->|"Queries job visibility"| visibility
-    jobProducer -->|"Writes creation and submission EDRs"| visibility
-    scheduler -->|"Writes acknowledgement, retrieval, and outcome EDRs"| visibility
+    jobProducer -->|"Submits scheduled jobs over HTTP"| scheduler
+    scheduler -->|"Publishes lifecycle EDRs through Kafka"| visibility
     visibility -->|"Returns explainable state and freshness"| apiClient
     visibility -->|"Returns scenario reports"| testAuthor
 ```
 
-The external systems in this view are simulated by Python components during scenario runs.
-In a production deployment, the actual producer and scheduler remain outside the system
-boundary.
+During deterministic scenario runs, the producer, scheduler, transport, and visibility
+engine are simulated in one process. In the durable topology they are separate roles joined
+only through the scheduler database, transactional outbox, Kafka, and EDR database.
 
 ### 3.2 External interfaces
 
 | Interface | Direction | Purpose |
 | --- | --- | --- |
-| Lifecycle EDR | Inbound | Record observable job facts. |
-| `POST /edrs` | Inbound | Submit one canonical EDR to the current in-memory projector. |
+| `POST /scheduler/jobs` | Inbound | Durably create an idempotent scheduled job. |
+| Lifecycle EDR topic | Internal | Carry canonical facts from scheduler outbox to EDR journal. |
+| `POST /edrs` | Inbound | Optional simulation or Kafka-backed external EDR ingress. |
 | `GET /edr-lifecycle` | Outbound | Retrieve EDR type, lifecycle group, and requirement mappings. |
 | `GET /scheduled-jobs/{jobId}` | Outbound | Retrieve one business-oriented visibility record. |
 | `GET /scheduled-jobs/{jobId}/attempts` | Outbound | Retrieve observed attempt history. |
 | `GET /scheduled-jobs` | Outbound | Search by status, correlation, and scheduled range. |
 | `POST /reconciliation-runs` | Inbound | Run time-based consistency checks. |
 | Simulation JSON/Markdown | Outbound | Preserve scenario inputs, decisions, assertions, and results. |
+| `/health/live`, `/health/ready`, `/metrics` | Outbound | Report role lifecycle, dependency readiness, and telemetry. |
 
 ## 4. Solution strategy
 
@@ -126,13 +133,13 @@ The architecture uses an event-derived materialized view:
 7. Make batching, polling cadence, worker capacity, and transport faults configurable.
 8. Run all behavior against a virtual clock and emit assertion-rich reports.
 
-The current implementation optimizes for behavioral correctness and repeatability. The
-target architecture replaces process-local state with durable event and projection stores
-so that API, projection, polling, and reconciliation can scale independently.
+The simulation optimizes for behavioral correctness and repeatability. The production-like
+runtime implements the durable stores and independently runnable scheduler API, scheduler
+worker, publisher, Connect sink, projector, and visibility API.
 
 ## 5. Building-block view
 
-### 5.1 C4 level 2 — current containers and execution modes
+### 5.1 C4 level 2 — simulation execution mode
 
 ```mermaid
 flowchart LR
@@ -152,9 +159,8 @@ flowchart LR
     api -->|"Projects and queries EDRs"| apiMemory
 ```
 
-The two entry points do not currently share state. Starting the API creates a new
-`VisibilityEngine`; running the CLI creates independent engines per scenario. This is
-intentional for simulation isolation but is a production limitation.
+The simulation entry points intentionally do not share state. Production commands use the
+durable topology below instead of `job_visibility.api:app`.
 
 ### 5.2 C4 level 3 — simulation CLI components
 
@@ -209,36 +215,82 @@ flowchart LR
     query -->|"Reads projection and freshness"| state
 ```
 
-### 5.4 C4 level 2 — production target containers
+### 5.4 C4 level 2 — durable production containers
 
 ```mermaid
 flowchart LR
     producer["External system: Job producer"]
-    scheduler["External system: Polling scheduler"]
-    client["Person: API client"]
+    client["Person: Visibility client"]
+    schedulerApi["Container: Scheduler API"]
+    worker["Container: Scheduler worker"]
+    schedulerDb[("Container data: Scheduler PostgreSQL")]
+    publisher["Container: Outbox publisher"]
+    kafka[["Container data: Kafka lifecycle topic"]]
+    connect["Container: Kafka Connect JDBC sink"]
+    edrDb[("Container data: EDR PostgreSQL")]
+    projector["Container: Projection worker"]
+    visibilityApi["Container: Visibility API"]
+    cassandra[("Container data: Cassandra workload")]
 
-    edrStream[["Container: Durable EDR stream"]]
-    projector["Container: Visibility projector"]
-    reconciler["Container: Reconciliation worker"]
-    api["Container: Visibility API"]
-    database[("Container: PostgreSQL visibility store")]
-
-    producer -.->|"Publishes lifecycle EDRs"| edrStream
-    scheduler -.->|"Publishes acknowledgement and outcome EDRs"| edrStream
-    edrStream -.->|"Delivers EDRs"| projector
-    projector -->|"Writes event journal and projections"| database
-    reconciler -->|"Reads jobs and writes findings"| database
-    client -->|"HTTPS queries"| api
-    api -->|"Reads visibility and attempts"| database
+    producer -->|"POST /scheduler/jobs"| schedulerApi
+    schedulerApi -->|"Job plus initial outbox facts"| schedulerDb
+    worker -->|"Claim, fence, attempt, and outcome"| schedulerDb
+    worker -.->|"Handler-specific operations"| cassandra
+    publisher -->|"Lease acknowledged outbox delivery"| schedulerDb
+    publisher -->|"Canonical EDR keyed by jobId"| kafka
+    kafka --> connect
+    connect -->|"Immutable journal insert/upsert"| edrDb
+    projector -->|"Journal checkpoints and projections"| edrDb
+    client -->|"GET visibility and attempts"| visibilityApi
+    visibilityApi -->|"Read-only projection queries"| edrDb
 ```
 
-The durable stream is intentionally technology-neutral. Selecting Kafka, a managed queue,
-or a database-backed inbox requires delivery, ordering, retention, and operations data that
-the current repository does not provide.
+The scheduler API and worker never read EDR PostgreSQL. The visibility API never reads
+scheduler PostgreSQL. Kafka Connect is the only raw-journal writer, and projection is
+rebuildable from that journal.
 
 ## 6. Runtime view
 
-### 6.1 Polling, batch selection, and execution
+### 6.1 Durable submission-to-visibility sequence
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant SchedulerAPI as Scheduler API
+    participant SchedulerDB as Scheduler PostgreSQL
+    participant Worker as Scheduler worker
+    participant Publisher as Outbox publisher
+    participant Kafka
+    participant Connect as Kafka Connect
+    participant EDRDB as EDR PostgreSQL
+    participant Projector
+    participant VisibilityAPI as Visibility API
+
+    Client->>SchedulerAPI: POST /scheduler/jobs
+    SchedulerAPI->>SchedulerDB: Insert job + initial outbox EDRs
+    SchedulerDB-->>SchedulerAPI: Commit
+    SchedulerAPI-->>Client: 201 created + visibility statusUrl
+    Worker->>SchedulerDB: Recover expired + claim due (SKIP LOCKED)
+    SchedulerDB-->>Worker: Job + attempt + fencing token
+    Worker->>SchedulerDB: Start and terminal outcome + outbox EDRs
+    Publisher->>SchedulerDB: Lease unpublished outbox rows
+    Publisher->>Kafka: Publish canonical EDRs
+    Kafka-->>Publisher: Broker acknowledgements
+    Publisher->>SchedulerDB: Mark published
+    Kafka->>Connect: Consume lifecycle EDRs
+    Connect->>EDRDB: Persist immutable edr_events
+    Projector->>EDRDB: Apply unprojected journal facts atomically
+    Client->>VisibilityAPI: GET /scheduled-jobs/{jobId}
+    VisibilityAPI->>EDRDB: Read EDR-derived projection
+    EDRDB-->>VisibilityAPI: Status, attempts, freshness, findings
+    VisibilityAPI-->>Client: 200 visibility response
+```
+
+Submission success proves only that the scheduler transaction committed. Until Kafka,
+Connect, and projection catch up, visibility may return the qualified `404` or an older
+`dataAsOf`; it never substitutes scheduler state.
+
+### 6.2 Simulation polling, batch selection, and execution
 
 ```mermaid
 sequenceDiagram
@@ -265,7 +317,7 @@ sequenceDiagram
 Overflow jobs remain eligible and are considered by the next poll. Retrieval and execution
 are distinct because a worker may not be available after the scheduler claims a job.
 
-### 6.2 Idempotent projection with optimistic concurrency
+### 6.3 Idempotent projection with transactional checkpoints
 
 ```mermaid
 sequenceDiagram
@@ -294,10 +346,11 @@ sequenceDiagram
     end
 ```
 
-The current engine performs this behavior under a process-local reentrant lock. The target
-store performs the conditional update transactionally in PostgreSQL.
+The simulation engine performs equivalent behavior under a process-local reentrant lock.
+The durable projector commits projection state and `projected_events` checkpoints together
+in EDR PostgreSQL.
 
-### 6.3 Late evidence repairs an overdue job
+### 6.4 Late evidence repairs an overdue job
 
 ```mermaid
 sequenceDiagram
@@ -318,7 +371,7 @@ sequenceDiagram
 
 ## 7. Deployment view
 
-### 7.1 Current local and CI deployment
+### 7.1 Simulation-only local and CI deployment
 
 ```mermaid
 flowchart TB
@@ -343,32 +396,45 @@ Properties:
 - The CLI writes reports to `simulation-results/`.
 - CI executes formatting, linting, tests, and the minimum simulation set.
 
-### 7.2 Production target deployment
+### 7.2 Production-like local deployment
 
 ```mermaid
 flowchart TB
-    gateway["Node: Load balancer or API gateway"]
-    apiPool["Node pool: Visibility API replicas"]
-    projectorPool["Node pool: Projector replicas"]
-    reconcilePool["Node pool: Reconciliation workers"]
-    stream["Managed resource: Durable EDR stream"]
-    postgres[("Managed resource: PostgreSQL primary")]
-    replica[("Managed resource: Read replica")]
-    telemetry["Managed resource: Metrics and logs"]
+    workstation["Node: Developer or CI runner"]
+    schedulerApi["Process: scheduler-api :8000"]
+    visibilityApi["Process: visibility-api :8001"]
+    worker["Process: scheduler-worker"]
+    publisher["Process: outbox-publisher"]
+    projector["Process: projector"]
+    schedulerPg[("Container: scheduler-postgres :5432")]
+    edrPg[("Container: edr-postgres :5433")]
+    kafka["Container: Kafka :9092"]
+    registry["Container: Schema Registry :8081"]
+    connect["Container: Kafka Connect :8083"]
+    cassandra["Container: Cassandra via Toxiproxy :9042"]
 
-    gateway --> apiPool
-    apiPool --> replica
-    stream --> projectorPool
-    projectorPool --> postgres
-    reconcilePool --> postgres
-    postgres --> replica
-    apiPool --> telemetry
-    projectorPool --> telemetry
-    reconcilePool --> telemetry
+    workstation --> schedulerApi
+    workstation --> visibilityApi
+    schedulerApi --> schedulerPg
+    worker --> schedulerPg
+    worker -.-> cassandra
+    publisher --> schedulerPg
+    publisher --> kafka
+    publisher --> registry
+    kafka --> connect
+    registry --> connect
+    connect --> edrPg
+    projector --> edrPg
+    visibilityApi --> edrPg
 ```
 
-The read replica is optional. If used, API freshness must expose replica delay rather than
-claiming strong consistency.
+`scripts/infra bootstrap` starts and migrates durable infrastructure. `scripts/infra
+up-apps` starts the role-isolated application profile. `scripts/infra smoke-http` verifies
+creation, replay, conflict, execution, delivery, projection, attempt history, and search.
+
+Production may replace local containers with managed or clustered services without changing
+the authority boundaries. A read replica remains optional; if used, API freshness must
+expose replica delay rather than claim strong consistency.
 
 ## 8. Cross-cutting concepts
 
@@ -400,10 +466,12 @@ claiming strong consistency.
 
 ### 8.4 Concurrency
 
-- The current engine serializes updates with `RLock` and supports expected-version checks.
-- The target store uses a unique event key, a job version, and conditional updates.
-- Target pollers claim eligible work with `FOR UPDATE SKIP LOCKED` or equivalent atomic
-  leasing.
+- The simulation engine serializes updates with `RLock` and supports expected-version checks.
+- Durable scheduler pollers claim eligible work with `FOR UPDATE SKIP LOCKED` and opaque
+  lease/fencing tokens.
+- Scheduler state, attempt creation, and associated outbox EDRs commit atomically.
+- EDR journal identity, projection checkpoints, and Cassandra conditional operations enforce
+  idempotency at their respective authority boundaries.
 
 ### 8.5 Observability
 
@@ -416,7 +484,7 @@ Every job response should expose:
 - Lifecycle completeness flags.
 - Active and historical reconciliation findings.
 
-Target operational metrics include eligible queue depth, oldest eligible job age, retrieved
+Operational metrics include eligible queue depth, oldest eligible job age, retrieved
 batch size, batch saturation, poll duration, skipped polls, claim conflicts, worker wait,
 execution delay, EDR processing delay, and projection retries.
 
@@ -435,9 +503,9 @@ normally produces 21 EDRs:
 | **Total** |  | **21** |
 
 When optional scheduling and retrieval rows are disabled, a reduced lifecycle retaining
-attempt and retry evidence is approximately 11 EDRs. This is still materially larger than
-the single final EDR written by the current production flow, but it makes callback timing,
-individual failures, retry decisions, and eventual success auditable.
+attempt and retry evidence is approximately 11 EDRs. The fuller lifecycle uses more storage,
+but it makes callback timing, individual failures, retry decisions, and eventual success
+auditable.
 
 The following order-of-magnitude estimates assume metadata-only EDRs. They include the
 event journal, indexes, projections, attempt summaries, and findings, but exclude large
@@ -452,7 +520,7 @@ request or response bodies:
 
 These are capacity-planning ranges, not measured database sizes. Schema design, JSON versus
 typed columns, index selection, compression, and average field lengths must be benchmarked
-before production sizing. The target persistence design should:
+before production sizing. The persistence lifecycle should:
 
 - Keep current job projections and attempt summaries in PostgreSQL.
 - Keep raw EDR payloads small and store large bodies in object storage via
@@ -467,8 +535,8 @@ before production sizing. The target persistence design should:
 
 ### 8.7 Security and privacy
 
-The current API has no authentication or authorization and must be treated as a local
-simulation interface. A production deployment requires:
+The repository supplies local production-like APIs but does not implement an identity
+provider. Deployment outside a trusted development network requires:
 
 - Authenticated EDR ingestion and client access.
 - Authorization by job type, tenant, or correlation scope.
@@ -487,8 +555,11 @@ simulation interface. A production deployment requires:
 | Bound retrieval by configurable `X` | Accepted | Matches the company scheduler and prevents unbounded poll work. | Hotspots create measurable backlog. |
 | Keep `recordedStatus` separate from `status` | Accepted | Time-derived conclusions do not overwrite evidence. | Clients must understand both fields. |
 | Start with an in-memory engine | Accepted for simulation | Minimizes infrastructure and validates domain rules first. | State is ephemeral and cannot scale across processes. |
-| Use PostgreSQL for the target visibility store | Proposed | Transactions, unique constraints, indexes, and conditional updates fit the model. | Adds operating cost and migration work. |
-| Keep the durable EDR transport technology-neutral | Open | Delivery and scale requirements are not yet measured. | Production container design is incomplete until selected. |
+| Use separate PostgreSQL scheduler and EDR authorities | Accepted and implemented | Transactions and ownership isolation fit operational and evidence state. | Roles require separate URLs, credentials, migrations, and recovery. |
+| Use a transactional scheduler outbox and Kafka | Accepted and implemented | Scheduler commits cannot depend on broker availability. | Publication is at-least-once and journal ingestion must be idempotent. |
+| Use Kafka Connect as the raw EDR journal writer | Accepted and implemented | Keeps scheduler/application code outside the EDR authority. | Connector health, DLQ, and offsets are operational dependencies. |
+| Separate scheduler and visibility API roles | Accepted and implemented | A combined process would need both database credentials. | Clients use port/service-specific write and read endpoints. |
+| Use a standalone fenced polling worker | Accepted and implemented | Multiple replicas can claim bounded disjoint work safely. | Lease, heartbeat, recovery, and backlog age require monitoring. |
 
 ## 10. Quality requirements
 
@@ -512,13 +583,12 @@ The executable evidence for these requirements is summarized in
 
 | Risk | Impact | Mitigation or next step |
 | --- | --- | --- |
-| In-memory state | Data loss and no horizontal scaling. | Implement PostgreSQL repositories and migrations. |
-| CLI and API use separate engines | API cannot inspect a completed CLI run. | Share a durable store or import a saved run explicitly. |
-| Linear scan and sort per poll | Poor open-task scalability. | Query an indexed eligibility table with bounded claims. |
-| Single process lock | Hotspot bottleneck. | Use database transactions, sharding, and multiple consumers. |
-| No authenticated API | Unsafe outside local development. | Add identity, authorization, TLS, and rate limiting. |
-| Technology-neutral EDR stream | Delivery guarantees remain undefined. | Benchmark and select transport based on volume and ordering needs. |
-| No production load test | Architecture scores remain estimates. | Add backlog, throughput, latency, and concurrency benchmarks. |
+| Simulation state is in-memory | Simulation API cannot inspect a completed CLI run. | Use the durable application profile for shared operational state. |
+| Local topology is single-node per dependency | Laptop chaos cannot establish clustered production availability. | Validate broker, PostgreSQL, Cassandra, and Connect topology separately before release. |
+| Polling and batch limits | Large due-job hotspots can accumulate delay. | Monitor oldest-due age, scale workers, and benchmark representative workloads. |
+| Application authentication is external | Scheduler write API is unsafe on an untrusted network by itself. | Terminate TLS/authentication at a trusted ingress and add authorization/rate policies. |
+| Single Kafka partition key can create hot jobs | Per-job ordering may concentrate skewed traffic. | Measure partition distribution and increase partitions with keyed-order compatibility. |
+| Representative production load evidence remains incomplete | Capacity and freshness limits remain estimates. | Complete the versioned Spec 003 workload, backlog recovery, and soak gates. |
 | Report files are snapshots | Results can become stale after code changes. | Regenerate them in CI and record the source commit in each report. |
 | Poll interval limits precision | Jobs may start up to one minute late before backlog. | Shorten polling or adopt event/timer wake-up for tighter SLAs. |
 

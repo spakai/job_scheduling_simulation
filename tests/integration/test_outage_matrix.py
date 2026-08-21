@@ -120,6 +120,9 @@ def test_kafka_outage_preserves_and_drains_scheduler_outbox(
             )
     finally:
         controller.start("kafka")
+        # The single-node local Connect worker can exit when its only broker disappears.
+        # Restore the dependent process explicitly so later scenarios do not inherit outage.
+        controller.start("kafka-connect")
 
     try:
         with scheduler_engine.begin() as connection:

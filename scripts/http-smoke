@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+scheduler_url=${SCHEDULER_API_URL:-http://localhost:8000}
+visibility_url=${VISIBILITY_API_URL:-http://localhost:8001}
+timeout_seconds=${HTTP_SMOKE_TIMEOUT_SECONDS:-60}
+job_id="spec004-smoke-$(date +%s)-$$"
+correlation_id="spec004-correlation-$job_id"
+scheduled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+result_dir=$(mktemp -d)
+trap 'rm -rf -- "$result_dir"' EXIT
+
+payload="{\"jobId\":\"$job_id\",\"correlationId\":\"$correlation_id\",\"jobType\":\"FIBONACCI\",\"scheduledAt\":\"$scheduled_at\",\"payload\":{\"limit\":10000},\"maxAttempts\":3}"
+
+created_code=$(curl -sS -o "$result_dir/created.json" -w '%{http_code}' \
+  -X POST "$scheduler_url/scheduler/jobs" -H 'Content-Type: application/json' --data "$payload")
+[[ $created_code == 201 ]]
+
+replay_code=$(curl -sS -o "$result_dir/replay.json" -w '%{http_code}' \
+  -X POST "$scheduler_url/scheduler/jobs" -H 'Content-Type: application/json' --data "$payload")
+[[ $replay_code == 200 ]]
+grep -q '"created":false' "$result_dir/replay.json"
+
+conflict_payload=${payload/10000/9999}
+conflict_code=$(curl -sS -o "$result_dir/conflict.json" -w '%{http_code}' \
+  -X POST "$scheduler_url/scheduler/jobs" -H 'Content-Type: application/json' \
+  --data "$conflict_payload")
+[[ $conflict_code == 409 ]]
+
+started=$(date +%s)
+while true; do
+  visibility_code=$(curl -sS -o "$result_dir/visibility.json" -w '%{http_code}' \
+    "$visibility_url/scheduled-jobs/$job_id")
+  if [[ $visibility_code == 200 ]] && grep -q '"status":"SUCCEEDED"' \
+    "$result_dir/visibility.json"; then
+    break
+  fi
+  if (( $(date +%s) - started >= timeout_seconds )); then
+    echo "timed out waiting for terminal visibility for $job_id" >&2
+    cat "$result_dir/visibility.json" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+curl -fsS "$visibility_url/scheduled-jobs/$job_id/attempts" > "$result_dir/attempts.json"
+grep -q '"attemptNumber":1' "$result_dir/attempts.json"
+curl -fsS "$visibility_url/scheduled-jobs?correlationId=$correlation_id" \
+  > "$result_dir/search.json"
+grep -q "\"jobId\":\"$job_id\"" "$result_dir/search.json"
+
+echo "production HTTP smoke passed (jobId=$job_id)"
