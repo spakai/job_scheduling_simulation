@@ -30,26 +30,31 @@ The visibility specification and implementation plan are in
 [`specs/001-scheduled-job-visibility`](specs/001-scheduled-job-visibility/). The durable
 PostgreSQL and Kafka architecture is specified in
 [`specs/002-real-persistence-kafka`](specs/002-real-persistence-kafka/).
+Production hardening, automated chaos evidence, and release gates are defined in
+[`specs/003-production-hardening-resilience`](specs/003-production-hardening-resilience/).
 The arc42-aligned C4 architecture documentation is in [`architecture.md`](architecture.md).
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).
 
 ## Spec 002 local infrastructure
 
-The durable stack uses separate `scheduler` and `edr` PostgreSQL databases, Kafka in KRaft
-mode, Schema Registry, Kafka Connect, Cassandra, and a Toxiproxy endpoint on port 9042.
+The durable stack uses physically separate scheduler and EDR PostgreSQL containers, Kafka in
+KRaft mode, Schema Registry, Kafka Connect, Cassandra, and a Toxiproxy endpoint on port 9042.
 Container tags and the JDBC connector version are pinned in `compose.yaml`.
 
 ```bash
-docker compose up -d --build
-docker compose ps --all
+scripts/infra bootstrap
 
 export SCHEDULER_DATABASE_URL='postgresql+psycopg://scheduler_owner:scheduler-local@localhost:5432/scheduler'
-export EDR_DATABASE_URL='postgresql+psycopg://edr_owner:edr-local@localhost:5432/edr'
+export EDR_DATABASE_URL='postgresql+psycopg://edr_owner:edr-local@localhost:5433/edr'
 .venv/bin/alembic -n scheduler upgrade head
 .venv/bin/alembic -n edr upgrade head
 bash infra/kafka/connect/apply.sh
 ```
+
+The bounded infrastructure interface also provides `ready`, `migrate`, `connector-apply`,
+`test-postgres`, `test-resilience`, `diagnostics`, and `down` commands. Destructive volume
+cleanup requires `CONFIRM_DELETE_TEST_VOLUMES` to exactly match the named Compose project.
 
 Run the durable background roles independently:
 
@@ -66,6 +71,9 @@ alone. Operational recovery guidance is in
 [`docs/spec-002-runbook.md`](docs/spec-002-runbook.md).
 The failure model, discovered defects, recovery mechanisms, verified scenarios, and remaining
 chaos-test gaps are documented in [`docs/chaos.md`](docs/chaos.md).
+The bounded resilience workflow and current automation evidence are documented in
+[`docs/spec-003-runbook.md`](docs/spec-003-runbook.md) and
+[`docs/spec-003-evidence.md`](docs/spec-003-evidence.md).
 
 Inspect migration and pipeline state with:
 

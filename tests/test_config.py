@@ -19,7 +19,15 @@ def test_loads_role_specific_configuration_from_environment() -> None:
             "CASSANDRA_PAGE_SIZE": "250",
             "CASSANDRA_PORT": "9142",
             "SCHEDULER_DATABASE_POOL_SIZE": "7",
+            "SCHEDULER_DATABASE_CONNECT_TIMEOUT_SECONDS": "3",
+            "SCHEDULER_DATABASE_STATEMENT_TIMEOUT_MS": "12000",
+            "SCHEDULER_DATABASE_LOCK_TIMEOUT_MS": "2000",
+            "SCHEDULER_DATABASE_TRANSACTION_TIMEOUT_MS": "20000",
             "EDR_DATABASE_MAX_OVERFLOW": "2",
+            "KAFKA_REQUEST_TIMEOUT_MS": "4000",
+            "KAFKA_DELIVERY_TIMEOUT_MS": "12000",
+            "KAFKA_FLUSH_TIMEOUT_SECONDS": "8",
+            "SCHEMA_REGISTRY_CONNECT_TIMEOUT_SECONDS": "2.5",
             "OUTBOX_RETRY_INITIAL_SECONDS": "0.25",
             "SINK_BATCH_SIZE": "1000",
         }
@@ -31,7 +39,15 @@ def test_loads_role_specific_configuration_from_environment() -> None:
     assert config.cassandra.page_size == 250
     assert config.cassandra.port == 9142
     assert config.scheduler_database.pool_size == 7
+    assert config.scheduler_database.connect_timeout_seconds == 3
+    assert config.scheduler_database.statement_timeout_ms == 12_000
+    assert config.scheduler_database.lock_timeout_ms == 2_000
+    assert config.scheduler_database.transaction_timeout_ms == 20_000
     assert config.edr_database.max_overflow == 2
+    assert config.kafka.request_timeout_ms == 4_000
+    assert config.kafka.delivery_timeout_ms == 12_000
+    assert config.kafka.flush_timeout_seconds == 8
+    assert config.kafka.schema_registry_connect_timeout_seconds == 2.5
     assert config.outbox.retry_initial_seconds == 0.25
     assert config.sink.batch_size == 1000
 
@@ -57,6 +73,33 @@ def test_rejects_unbounded_or_inconsistent_tuning() -> None:
             | {
                 "CASSANDRA_REQUEST_TIMEOUT_MS": "5000",
                 "CASSANDRA_EXECUTION_TIMEOUT_MS": "1000",
+            }
+        )
+
+    with pytest.raises(ValidationError, match="lock timeout"):
+        AppConfig.from_env(
+            BASE_ENV
+            | {
+                "SCHEDULER_DATABASE_LOCK_TIMEOUT_MS": "2000",
+                "SCHEDULER_DATABASE_STATEMENT_TIMEOUT_MS": "1000",
+            }
+        )
+
+    with pytest.raises(ValidationError, match="Kafka request timeout"):
+        AppConfig.from_env(
+            BASE_ENV
+            | {
+                "KAFKA_REQUEST_TIMEOUT_MS": "20000",
+                "KAFKA_DELIVERY_TIMEOUT_MS": "10000",
+            }
+        )
+
+    with pytest.raises(ValidationError, match="Kafka flush timeout"):
+        AppConfig.from_env(
+            BASE_ENV
+            | {
+                "KAFKA_FLUSH_TIMEOUT_SECONDS": "31",
+                "KAFKA_DELIVERY_TIMEOUT_MS": "30000",
             }
         )
 

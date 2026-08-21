@@ -1,0 +1,8 @@
+CREATE ROLE edr_owner LOGIN PASSWORD 'edr-local';
+CREATE ROLE edr_sink LOGIN PASSWORD 'edr-sink-local';
+CREATE DATABASE edr OWNER edr_owner;
+REVOKE CONNECT ON DATABASE edr FROM PUBLIC;
+GRANT CONNECT ON DATABASE edr TO edr_owner;
+GRANT CONNECT ON DATABASE edr TO edr_sink;
+\connect edr
+GRANT USAGE ON SCHEMA public TO edr_sink;

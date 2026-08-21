@@ -1,7 +1,7 @@
 name: job-visibility
 
 services:
-  postgres:
+  scheduler-postgres:
     image: postgres:17.6
     environment:
       POSTGRES_USER: postgres
@@ -9,8 +9,24 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+      - scheduler-postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/scheduler-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  edr-postgres:
+    image: postgres:17.6
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres-local
+    ports:
+      - "5433:5432"
+    volumes:
+      - edr-postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/edr-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
       interval: 5s
@@ -65,7 +81,7 @@ services:
     build:
       context: ./infra/kafka/connect
     depends_on:
-      postgres:
+      edr-postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
@@ -87,7 +103,7 @@ services:
       CONNECT_VALUE_CONVERTER: io.confluent.connect.json.JsonSchemaConverter
       CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
       CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
-      EDR_DATABASE_URL: jdbc:postgresql://postgres:5432/edr
+      EDR_DATABASE_URL: jdbc:postgresql://edr-postgres:5432/edr
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors >/dev/null"]
       interval: 10s
@@ -161,6 +177,7 @@ services:
         http://toxiproxy:8474/proxies
 
 volumes:
-  postgres-data:
+  scheduler-postgres-data:
+  edr-postgres-data:
   kafka-data:
   cassandra-data:

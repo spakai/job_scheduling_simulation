@@ -3,7 +3,7 @@
   "config": {
     "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
     "topics": "job-lifecycle-edr.v1",
-    "connection.url": "jdbc:postgresql://postgres:5432/edr?stringtype=unspecified",
+    "connection.url": "jdbc:postgresql://edr-postgres:5432/edr?stringtype=unspecified",
     "connection.user": "edr_sink",
     "connection.password": "edr-sink-local",
     "table.name.format": "edr_events",

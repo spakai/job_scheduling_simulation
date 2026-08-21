@@ -1,0 +1,62 @@
+name: Resilience
+
+on:
+  pull_request:
+    paths:
+      - "compose.yaml"
+      - "infra/**"
+      - "migrations/**"
+      - "src/job_visibility/**"
+      - "tests/integration/**"
+      - ".github/workflows/resilience.yml"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  postgres-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e '.[dev]'
+      - run: docker compose --project-name job-visibility-ci up -d scheduler-postgres edr-postgres
+      - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/infra ready-postgres
+      - run: scripts/infra migrate
+      - run: scripts/infra test-postgres
+      - if: failure()
+        run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/collect-test-evidence resilience-results/postgres
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-resilience-evidence
+          path: resilience-results/postgres
+      - if: always()
+        run: docker compose --project-name job-visibility-ci down --volumes --remove-orphans
+
+  nightly-resilience:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e '.[dev]'
+      - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-nightly scripts/infra bootstrap
+      - run: RUN_CASSANDRA_TESTS=1 RUN_OUTAGE_TESTS=1 scripts/infra test-resilience
+      - if: failure()
+        run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-nightly scripts/collect-test-evidence resilience-results/nightly
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-resilience-evidence
+          path: resilience-results/nightly
+      - if: always()
+        run: docker compose --project-name job-visibility-nightly down --volumes --remove-orphans

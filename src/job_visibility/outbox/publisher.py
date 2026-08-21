@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -43,6 +44,12 @@ class ConfluentBrokerProducer:
         *,
         schema_registry_url: str | None = None,
         schema_subject: str = "job-lifecycle-edr.v1-value",
+        socket_timeout_ms: int = 10_000,
+        request_timeout_ms: int = 10_000,
+        delivery_timeout_ms: int = 30_000,
+        metadata_timeout_ms: int = 10_000,
+        schema_registry_connect_timeout_seconds: float = 5,
+        schema_registry_read_timeout_seconds: float = 10,
     ) -> None:
         from confluent_kafka import Producer
 
@@ -51,15 +58,30 @@ class ConfluentBrokerProducer:
                 "bootstrap.servers": bootstrap_servers,
                 "enable.idempotence": True,
                 "acks": "all",
-                "delivery.timeout.ms": 30_000,
+                "socket.timeout.ms": socket_timeout_ms,
+                "request.timeout.ms": request_timeout_ms,
+                "delivery.timeout.ms": delivery_timeout_ms,
             }
         )
+        self._delivery_timeout_seconds = delivery_timeout_ms / 1_000
+        self._metadata_timeout_seconds = metadata_timeout_ms / 1_000
         self._serializer = None
         if schema_registry_url:
             from confluent_kafka.schema_registry import SchemaRegistryClient
             from confluent_kafka.schema_registry.json_schema import JSONSerializer
+            from httpx import Timeout
 
-            registry = SchemaRegistryClient({"url": schema_registry_url})
+            registry = SchemaRegistryClient(
+                {
+                    "url": schema_registry_url,
+                    "timeout": Timeout(
+                        connect=schema_registry_connect_timeout_seconds,
+                        read=schema_registry_read_timeout_seconds,
+                        write=schema_registry_read_timeout_seconds,
+                        pool=schema_registry_connect_timeout_seconds,
+                    ),
+                }
+            )
             schema = registry.get_latest_version(schema_subject).schema.schema_str
             self._serializer = JSONSerializer(
                 schema,
@@ -81,8 +103,11 @@ class ConfluentBrokerProducer:
             encoded = self._serializer(
                 json.loads(value), SerializationContext(topic, MessageField.VALUE)
             )
+        self._producer.list_topics(topic, timeout=self._metadata_timeout_seconds)
         self._producer.produce(topic, key=key.encode(), value=encoded, callback=callback)
-        self._producer.flush(30)
+        remaining = self._producer.flush(self._delivery_timeout_seconds)
+        if remaining:
+            raise TimeoutError(f"Kafka delivery timed out with {remaining} message(s) pending")
         if errors or not delivered:
             raise RuntimeError(str(errors[0]) if errors else "Kafka acknowledgement timed out")
         message = delivered[0]
@@ -104,11 +129,13 @@ class OutboxPublisher:
         retry_initial: float = 1,
         retry_max: float = 60,
         random_source: random.Random | None = None,
+        after_ack: Callable[[OutboxRecord, BrokerCoordinate], None] | None = None,
     ) -> None:
         self.sessions, self.producer, self.owner = sessions, producer, owner
         self.batch_size, self.lease_seconds = batch_size, lease_seconds
         self.retry_initial, self.retry_max = retry_initial, retry_max
         self.random = random_source or random.Random()
+        self.after_ack = after_ack
         self.stopping = False
 
     def run_once(self) -> int:
@@ -121,6 +148,8 @@ class OutboxPublisher:
                 coordinate = self.producer.publish(
                     topic=record.topic, key=record.message_key, value=record.payload
                 )
+                if self.after_ack is not None:
+                    self.after_ack(record, coordinate)
                 self._published(record, coordinate)
                 PUBLISHED.inc()
             except Exception as exc:

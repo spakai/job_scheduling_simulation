@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+command_name=${1:-help}
+shift || true
+project_name=${JOB_VISIBILITY_COMPOSE_PROJECT:-job-visibility-resilience}
+compose=(docker compose --project-name "$project_name")
+scheduler_url=${SCHEDULER_DATABASE_URL:-postgresql+psycopg://scheduler_owner:scheduler-local@localhost:5432/scheduler}
+edr_url=${EDR_DATABASE_URL:-postgresql+psycopg://edr_owner:edr-local@localhost:5433/edr}
+deadline_seconds=${INFRA_READY_TIMEOUT_SECONDS:-300}
+python_command=${PYTHON_COMMAND:-}
+if [[ -z "$python_command" ]]; then
+  if [[ -x .venv/bin/python ]]; then
+    python_command=.venv/bin/python
+  else
+    python_command=python3
+  fi
+fi
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "required command is unavailable: $1" >&2
+    exit 2
+  }
+}
+
+compose_cmd() {
+  require_command docker
+  "${compose[@]}" "$@"
+}
+
+ready() {
+  require_command curl
+  local started now state
+  started=$(date +%s)
+  while true; do
+    state=$(compose_cmd ps --format json 2>/dev/null || true)
+    if [[ -n "$state" ]] && ! grep -q '"Health":"starting"\|"State":"restarting"\|"State":"exited"' <<<"$state"; then
+      if curl -fsS http://localhost:8081/subjects >/dev/null 2>&1 &&
+        curl -fsS http://localhost:8083/connectors >/dev/null 2>&1 &&
+        curl -fsS http://localhost:8474/proxies/cassandra >/dev/null 2>&1; then
+        echo "infrastructure ready (project=$project_name)"
+        return
+      fi
+    fi
+    now=$(date +%s)
+    if (( now - started >= deadline_seconds )); then
+      echo "infrastructure readiness timed out after ${deadline_seconds}s" >&2
+      diagnostics
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+ready_postgres() {
+  local started now scheduler_state edr_state
+  started=$(date +%s)
+  while true; do
+    scheduler_state=$(compose_cmd ps --format json scheduler-postgres 2>/dev/null || true)
+    edr_state=$(compose_cmd ps --format json edr-postgres 2>/dev/null || true)
+    if grep -q '"Health":"healthy"' <<<"$scheduler_state" &&
+      grep -q '"Health":"healthy"' <<<"$edr_state"; then
+      echo "PostgreSQL authorities ready (project=$project_name)"
+      return
+    fi
+    now=$(date +%s)
+    if (( now - started >= deadline_seconds )); then
+      echo "PostgreSQL readiness timed out after ${deadline_seconds}s" >&2
+      diagnostics
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+migrate() {
+  SCHEDULER_DATABASE_URL=$scheduler_url "$python_command" -m alembic -n scheduler upgrade head
+  EDR_DATABASE_URL=$edr_url "$python_command" -m alembic -n edr upgrade head
+}
+
+diagnostics() {
+  compose_cmd ps --all || true
+  curl -fsS http://localhost:8083/connectors/edr-jdbc-sink-v1/status || true
+  curl -fsS http://localhost:8474/proxies || true
+}
+
+case "$command_name" in
+  up)
+    compose_cmd up -d --build
+    ;;
+  ready)
+    ready
+    ;;
+  ready-postgres)
+    ready_postgres
+    ;;
+  migrate)
+    migrate
+    ;;
+  connector-apply)
+    bash infra/kafka/connect/apply.sh
+    ;;
+  bootstrap)
+    compose_cmd up -d --build
+    ready
+    migrate
+    bash infra/kafka/connect/apply.sh
+    ;;
+  test-postgres)
+    RUN_POSTGRES_TESTS=1 SCHEDULER_DATABASE_URL=$scheduler_url EDR_DATABASE_URL=$edr_url \
+      "$python_command" -m pytest -m postgres "$@"
+    ;;
+  test-resilience)
+    RUN_RESILIENCE_TESTS=1 RUN_OUTAGE_TESTS=${RUN_OUTAGE_TESTS:-0} \
+      SCHEDULER_DATABASE_URL=$scheduler_url EDR_DATABASE_URL=$edr_url \
+      "$python_command" -m pytest -m 'integration or e2e' "$@"
+    ;;
+  diagnostics)
+    diagnostics
+    ;;
+  down)
+    compose_cmd down --remove-orphans
+    ;;
+  down-volumes)
+    if [[ ${CONFIRM_DELETE_TEST_VOLUMES:-} != "$project_name" ]]; then
+      echo "refusing volume deletion; set CONFIRM_DELETE_TEST_VOLUMES=$project_name" >&2
+      exit 2
+    fi
+    compose_cmd down --volumes --remove-orphans
+    ;;
+  help|*)
+    echo "usage: scripts/infra {up|ready|ready-postgres|migrate|connector-apply|bootstrap|test-postgres|test-resilience|diagnostics|down|down-volumes}"
+    ;;
+esac

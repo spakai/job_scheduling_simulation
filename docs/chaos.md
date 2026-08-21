@@ -199,8 +199,9 @@ Containment: reservation and finalization are fenced by checksum and operation I
 retrying, the client rereads `last_operation_id`; if it matches, the effect is successful and
 the marker can be repaired. No counter column or blind increment is used.
 
-Verified live: invoking the same logical operation twice retained the same operation ID and
-checksum. Packet-level loss specifically after the final write remains to be automated.
+Verified live: deterministic response loss immediately after Cassandra finalization was
+reconciled as success. Replaying the logical operation retained the same operation ID and
+checksum, proving one increment.
 
 ### Concurrent checksum conflict (`WORKER-06`)
 
@@ -210,8 +211,9 @@ Containment: only one conditional reservation wins. The loser returns a retryabl
 instead of incrementing blindly. A later attempt rereads and recomputes against the new
 checksum.
 
-Status: implemented by the conditional reservation protocol; a two-worker live race should
-be added to the integration suite.
+Verified live: two Cassandra drivers were synchronized after observing the same checksum.
+Exactly one reservation won; the loser retried against the new checksum, and each logical
+operation incremented once.
 
 ### Publisher crash or Kafka outage (`KAFKA-01`, `KAFKA-02`)
 
@@ -227,9 +229,9 @@ Containment:
 - Retries use bounded exponential backoff with jitter.
 - Duplicate delivery is a no-op at the immutable EDR journal and projection checkpoint.
 
-Verified live: identical republishing produced one journal row. A real broker-stop/backlog/
-recovery timing test is still needed, along with configurable producer delivery and socket
-timeouts.
+Verified live: identical republishing produced one journal row. During a real broker stop,
+scheduler facts accumulated in the durable outbox. After Kafka restarted, the outbox drained
+and Connect persisted the buffered EDRs within the bounded recovery window.
 
 ### EDR database outage (`SINK-01`)
 
@@ -239,9 +241,9 @@ Containment: Kafka remains the durable buffer. Connect retries and resumes from 
 offsets after PostgreSQL recovers. The visibility API never substitutes scheduler state for
 missing EDR evidence; `dataAsOf` exposes stale projection data.
 
-Verified live: PostgreSQL and Connect restart recovery preserved the journal and projection.
-A timed EDR-only outage is constrained locally because both logical databases share one
-PostgreSQL container.
+Verified live: the independently deployed EDR PostgreSQL container was stopped while the
+scheduler database remained reachable. Kafka buffered a valid EDR and Connect persisted it
+after EDR PostgreSQL recovered.
 
 ### Poison record and identity collision (`SINK-02`, `SINK-03`)
 
@@ -250,8 +252,23 @@ Failure: a record cannot be converted or violates journal immutability.
 Containment: converter/database retries are bounded, errors omit message bodies, and the DLQ
 retains diagnostic context. An event ID collision cannot mutate the first row.
 
-Verified live: an early incompatible schema and a deliberate different-payload collision
-reached the DLQ. The original event remained `JOB_CREATED`.
+Verified live: an unframed poison record reached the DLQ and a subsequent valid record
+persisted. A deliberate different-payload collision also reached the DLQ, the original event
+remained `JOB_CREATED`, and the following valid record progressed. These are automated by
+`test_poison_record_reaches_dlq_and_subsequent_record_progresses` and
+`test_event_identity_collision_is_immutable_and_partition_continues`.
+
+### Kafka Connect restart with buffered input (`PERSIST-01`)
+
+Failure: Kafka Connect stops before consuming a broker-acknowledged EDR.
+
+Containment: Kafka retains the record independently of the Connect worker. Connect stores
+consumer offsets in Kafka and resumes from its last committed offset after restart; journal
+upsert and immutability rules make replay safe.
+
+Verified live: a unique EDR was published while the Connect container was stopped. It was
+absent from `edr_events` during the outage and persisted after Connect returned healthy. This
+is automated by `test_connect_restart_replays_buffered_record`.
 
 ### Projector crash, ordering, and rebuild (`PROJ-01`–`PROJ-03`)
 
@@ -279,17 +296,26 @@ connection to scheduler, the Cassandra worker could not manage schema, and a dif
 
 ## Current gaps
 
-The architecture contains the principal failure modes, but these items should be completed
-before calling the system production-ready:
+Spec 003 tracks production hardening and evidence. The implementation status is:
 
-- Add configurable PostgreSQL connect, statement, transaction, and lock timeouts.
-- Add configurable Kafka request, socket, and delivery timeouts and a real broker-outage test.
-- Automate every live procedure above under pytest instead of relying partly on recorded
-  Phase 9 evidence.
-- Add packet-level loss after Cassandra finalization and a concurrent two-worker checksum
-  race.
-- Run load tests at representative volume and record p95/p99 freshness and throughput.
-- Run scheduler and EDR databases in separate containers for independent outage testing.
+| Item | Status |
+| --- | --- |
+| Configurable PostgreSQL connect, statement, transaction, and lock timeouts | Implemented; live timeout tests added. |
+| Configurable Kafka request, socket, metadata, delivery, and flush timeouts | Implemented; broker outage/backlog/drain passes live. |
+| Automated live procedures | PostgreSQL, Cassandra, publisher, projector, Kafka path, broker outage, sink outage, poison/DLQ continuation, Connect restart, and isolation suites pass; the rest of the restart matrix remains. |
+| Loss after Cassandra finalization | Deterministic post-finalize injection passes against Cassandra. |
+| Concurrent two-worker checksum race | Same-checksum two-driver race passes against Cassandra. |
+| Representative load with p95/p99 evidence | Workload profile proposed; durable runner and results remain. |
+| Independent scheduler and EDR database outages | Separate containers and automated stop/recovery test pass in both directions. |
 
-These are explicit evidence gaps, not reasons to infer state from another subsystem or relax
-the durability boundaries.
+See [`spec-003-evidence.md`](spec-003-evidence.md) for exact test names and the evidence that
+must still be produced. These are explicit evidence gaps, not reasons to infer state from
+another subsystem or relax the durability boundaries.
+
+## Running the scenarios locally
+
+Run `./try.sh` to bootstrap the isolated `job-visibility-resilience` Compose project and
+execute the poison-record, identity-collision, and Connect-restart scenarios. Run
+`./try.sh full` for the complete infrastructure resilience suite. Both modes use bounded
+test waits and leave the stack running for diagnostics; use `scripts/infra down` when it is
+no longer needed.
