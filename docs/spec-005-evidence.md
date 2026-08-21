@@ -42,7 +42,9 @@ The initial implementation passed:
 - Ruff formatting and linting;
 - the complete non-infrastructure pytest suite;
 - four application-fault tests against live PostgreSQL; and
-- `NET-01` and `NET-03` against live PostgreSQL/Toxiproxy.
+- `NET-01` and `NET-03` against live PostgreSQL/Toxiproxy;
+- the complete PostgreSQL/Spec 005 subset: 13 passed; and
+- the full integration, outage, and end-to-end resilience matrix: 23 passed in 78.04 seconds.
 
 This document deliberately distinguishes available injection controls from completed chaos
 evidence. A pressure command alone does not prove a resilience hypothesis.
