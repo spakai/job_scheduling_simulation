@@ -150,72 +150,41 @@ applied to the accepted event, and serialized simulation input events include
 
 ## Architecture assessment
 
-The following assessment uses the four 1–10 criteria from section 7.7 of
-[*Serverless Architectures on AWS*](https://learning.oreilly.com/library/view/serverless-architectures-on/9781617295423/OEBPS/Text/ch07.htm#sigil_toc_id_109):
-precision, scalability by number of open tasks, hotspot scalability, and cost. Higher
-scores are better.
+The current Specs 001–004 implementation scores **86/100 (A−)** as a strong,
+production-oriented prototype. The assessment covers the durable runtime and production-like
+HTTP path, not only the original in-memory simulator.
 
-These scores apply to the current in-memory simulation, not the stronger PostgreSQL
-architecture proposed in the implementation plan. The scalability scores are provisional
-until they are supported by load tests.
-
-| Criterion | Score | Assessment |
+| Area | Score | Assessment |
 | --- | ---: | --- |
-| Precision | **5/10** | One-minute polling introduces 0–60 seconds of normal delay. The `X` batch limit and worker capacity can add further polling intervals during a backlog. |
-| Scalability—open tasks | **3/10** | Jobs are held in memory, and eligible items are scanned and sorted by a single process. The current implementation is a simulator rather than durable production infrastructure. |
-| Scalability—hotspots | **4/10** | Bounded batches protect the scheduler from immediate overload, but excess jobs become backlog. The global lock and single scheduler queue remain bottlenecks. |
-| Cost | **9/10** | The simulator is inexpensive to run because it requires only a Python process. Some of this advantage comes from not yet providing production durability and availability. |
-| **Total** | **21/40** | **5.25/10 average** |
+| Service boundaries | **9/10** | Scheduler command handling and EDR visibility queries are clearly separated. |
+| Durability and recovery | **9/10** | PostgreSQL queues, a transactional outbox, Kafka, immutable EDR records, retries, and restart tests provide a strong reliability model. |
+| API design | **8.5/10** | Separate scheduling and visibility APIs expose realistic external contracts with idempotency and conflict behavior. |
+| Data ownership | **9/10** | Separate databases and a read-only EDR API account enforce ownership boundaries. |
+| Event-driven design | **9/10** | Transactional outbox publishing and durable projection avoid unsafe database/event dual writes. |
+| Observability | **7/10** | Health endpoints and evidence collection exist; production metrics, tracing, alerting, and correlation tooling remain limited. |
+| Security | **7/10** | Database least privilege is present, but API authentication, authorization, TLS, secret management, and audit controls remain. |
+| Scalability | **8/10** | Roles can scale independently; partitioning, backpressure limits, leader coordination, and capacity evidence need strengthening. |
+| Operability | **8.5/10** | Compose profiles, migrations, smoke tests, runbooks, CI, and chaos coverage support repeatable operation. |
+| Documentation | **9/10** | Specifications, plans, runbooks, evidence, and architecture flows closely match the implementation. |
 
-For context, the chapter's unweighted scores are:
-
-| Solution | Total |
-| --- | ---: |
-| Cron job | 25/40 |
-| DynamoDB TTL | 27/40 |
-| Step Functions | 23/40 |
-| SQS | 24/40 |
-| SQS + DynamoDB TTL | 32/40 |
-| **Current simulator scheduler** | **21/40** |
-
-### Precision and polling backlog
-
-If `X=100` and 401 jobs are already eligible, the last batch cannot be retrieved until
-approximately the fifth poll:
+The deployed responsibility flow is:
 
 ```text
-polls required = ceil(401 / 100) = 5
+client -> scheduler API -> durable queue -> scheduler worker -> transactional outbox
+       -> Kafka -> immutable EDR/projection -> visibility API
 ```
 
-With one-minute polling, some jobs therefore wait about four additional minutes even
-when the scheduler operates exactly as designed. The visibility projection explains this
-delay, but visibility alone cannot improve execution precision.
+The architecture is sound for a portfolio system and production-oriented prototype. Before a
+real production release, it still needs:
 
-### Production target
+- API authentication, tenant authorization, TLS, managed secrets, and audit controls.
+- Production metrics, distributed tracing, SLOs, alerting, and correlation dashboards.
+- A Kubernetes or cloud deployment model with autoscaling and graceful-rollout evidence.
+- Explicit Kafka partitioning and ordering guarantees keyed by `jobId`.
+- Rate limits, pagination limits, quotas, API versioning, and backpressure policies.
+- Retention, archival, disaster-recovery, and database backup/restore testing.
+- Load and capacity tests that prove behavior at the intended scale.
+- A final decision on Cassandra's long-term role in the visibility architecture.
 
-Completing the persistence and horizontal-scaling work in the implementation plan should
-make the following scores realistic:
-
-| Criterion | Target |
-| --- | ---: |
-| Precision | **6–7** |
-| Scalability—open tasks | **8** |
-| Scalability—hotspots | **7–8** |
-| Cost | **7** |
-| **Total** | **28–30/40** |
-
-Reaching that target requires:
-
-- PostgreSQL persistence with an index on eligibility and schedule time.
-- Atomic job claims using `FOR UPDATE SKIP LOCKED`.
-- Multiple concurrent pollers.
-- Queue partitioning or sharding for large hotspots.
-- Separate worker queues and autoscaling.
-- Backpressure and backlog-age metrics.
-- Load tests with hundreds of thousands or millions of open jobs.
-- A shorter polling interval or event/timer-based wake-up when sub-minute precision matters.
-
-Visibility and explainability are the current implementation's strongest capabilities. It
-distinguishes acknowledgement, retrieval, polling backlog, worker delay, missing EDRs,
-retries, conflicts, and stale data. It observes and explains scheduler behavior; it does
-not yet provide production-grade scheduling scalability.
+Addressing those gaps through a dedicated security, observability, and deployment-hardening
+specification would provide a credible path beyond **90/100**.
