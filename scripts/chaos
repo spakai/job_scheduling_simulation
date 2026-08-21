@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+command_name=${1:-list}
+shift || true
+
+python_command=${PYTHON_COMMAND:-}
+if [[ -z "$python_command" ]]; then
+  if [[ -x .venv/bin/python ]]; then
+    python_command=.venv/bin/python
+  else
+    python_command=python3
+  fi
+fi
+
+case "$command_name" in
+  list|validate|pressure|cleanup|stats)
+    "$python_command" -m job_visibility.chaos.cli "$command_name" "$@"
+    ;;
+  run)
+    scenario=${1:-}
+    case "$scenario" in
+      APP-01)
+        scripts/infra test-postgres \
+          tests/integration/test_application_faults.py::test_app_01_exception_before_commit_leaves_no_partial_state
+        ;;
+      APP-02)
+        scripts/infra test-postgres \
+          tests/integration/test_application_faults.py::test_app_02_exception_after_commit_replays_idempotently
+        ;;
+      APP-03)
+        scripts/infra test-postgres \
+          tests/integration/test_durable_recovery.py::test_publisher_crash_after_ack_leaves_republishable_outbox
+        ;;
+      APP-04)
+        scripts/infra test-postgres \
+          tests/integration/test_durable_recovery.py::test_projection_crash_rolls_back_and_replay_commits_once
+        ;;
+      *)
+        echo "scenario is not directly runnable; use pressure with its documented test: $scenario" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  evidence)
+    run_id=${1:?run ID is required}
+    case "$run_id" in
+      *[!a-zA-Z0-9_-]*|'') echo "invalid run ID" >&2; exit 2 ;;
+    esac
+    scripts/collect-test-evidence "resilience-results/chaos/$run_id"
+    ;;
+  *)
+    echo "usage: scripts/chaos {list|validate|run|pressure|stats|cleanup|evidence}" >&2
+    exit 2
+    ;;
+esac

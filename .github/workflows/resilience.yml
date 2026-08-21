@@ -26,10 +26,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e '.[dev]'
-      - run: docker compose --project-name job-visibility-ci up -d scheduler-postgres edr-postgres
+      - run: docker compose --project-name job-visibility-ci up -d scheduler-postgres edr-postgres toxiproxy-setup
       - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/infra ready-postgres
       - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/infra migrate
-      - run: scripts/infra test-postgres
+      - run: RUN_CHAOS_TESTS=1 scripts/infra test-postgres
       - if: failure()
         run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/collect-test-evidence resilience-results/postgres
       - if: failure()

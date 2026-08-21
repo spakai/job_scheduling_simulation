@@ -34,6 +34,8 @@ Production hardening, automated chaos evidence, and release gates are defined in
 [`specs/003-production-hardening-resilience`](specs/003-production-hardening-resilience/).
 Production API composition and the standalone scheduler runtime are specified in
 [`specs/004-production-api-runtime`](specs/004-production-api-runtime/).
+Resource-pressure experiments and deterministic application fault injection are specified in
+[`specs/005-resource-pressure-fault-injection`](specs/005-resource-pressure-fault-injection/).
 The arc42-aligned C4 architecture documentation is in [`architecture.md`](architecture.md).
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).
@@ -119,6 +121,20 @@ The bounded resilience workflow and current automation evidence are documented i
 [`docs/spec-003-evidence.md`](docs/spec-003-evidence.md).
 The production HTTP operating procedure is in
 [`docs/spec-004-runbook.md`](docs/spec-004-runbook.md).
+The bounded resource-pressure and application-fault procedure is in
+[`docs/spec-005-runbook.md`](docs/spec-005-runbook.md).
+
+List the Spec 005 experiment catalog and run a deterministic application-boundary scenario:
+
+```bash
+scripts/chaos list
+scripts/chaos run APP-01
+scripts/chaos run APP-02
+```
+
+Chaos mode is disabled by default and forbidden when `APP_ENVIRONMENT` is `production`.
+Resource controls additionally require an isolated Compose project named
+`job-visibility-chaos-*`.
 
 Inspect migration and pipeline state with:
 

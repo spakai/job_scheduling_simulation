@@ -7,6 +7,7 @@ project=${JOB_VISIBILITY_COMPOSE_PROJECT:-job-visibility-resilience}
 export JOB_VISIBILITY_COMPOSE_PROJECT=$project
 export RUN_CASSANDRA_TESTS=1
 export RUN_OUTAGE_TESTS=1
+export RUN_CHAOS_TESTS=1
 
 scripts/infra bootstrap
 
@@ -18,8 +19,13 @@ case "$mode" in
   full)
     scripts/infra test-resilience
     ;;
+  spec005)
+    scripts/infra test-postgres -vv \
+      tests/integration/test_application_faults.py \
+      tests/integration/test_resource_faults.py
+    ;;
   *)
-    echo "usage: $0 [new-chaos|full]" >&2
+    echo "usage: $0 [new-chaos|spec005|full]" >&2
     exit 2
     ;;
 esac

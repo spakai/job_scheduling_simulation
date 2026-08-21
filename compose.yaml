@@ -150,12 +150,11 @@ services:
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.12.0
-    depends_on:
-      cassandra:
-        condition: service_healthy
     ports:
       - "8474:8474"
       - "9042:9042"
+      - "15432:15432"
+      - "15433:15433"
     command: ["-host=0.0.0.0"]
     healthcheck:
       test: ["CMD", "/toxiproxy-cli", "list"]
@@ -174,6 +173,14 @@ services:
         curl -fsS http://toxiproxy:8474/proxies/cassandra >/dev/null ||
         curl -fsS -X POST -H 'Content-Type: application/json'
         --data '{"name":"cassandra","listen":"0.0.0.0:9042","upstream":"cassandra:9042"}'
+        http://toxiproxy:8474/proxies;
+        curl -fsS http://toxiproxy:8474/proxies/scheduler-postgres >/dev/null ||
+        curl -fsS -X POST -H 'Content-Type: application/json'
+        --data '{"name":"scheduler-postgres","listen":"0.0.0.0:15432","upstream":"scheduler-postgres:5432"}'
+        http://toxiproxy:8474/proxies;
+        curl -fsS http://toxiproxy:8474/proxies/edr-postgres >/dev/null ||
+        curl -fsS -X POST -H 'Content-Type: application/json'
+        --data '{"name":"edr-postgres","listen":"0.0.0.0:15433","upstream":"edr-postgres:5432"}'
         http://toxiproxy:8474/proxies
 
   scheduler-api:

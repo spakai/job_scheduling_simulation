@@ -10,6 +10,13 @@ import pytest
 from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from job_visibility.chaos import (
+    Checkpoint,
+    ConfiguredFaultInjector,
+    FaultAction,
+    FaultRule,
+    SyntheticFault,
+)
 from job_visibility.edr_store import ProjectionWorker
 from job_visibility.model import Event, EventType
 from job_visibility.outbox import BrokerCoordinate, OutboxPublisher, canonical_edr
@@ -145,6 +152,7 @@ def test_concurrent_pollers_claim_disjoint_jobs(scheduler_engine: Engine) -> Non
 
 @pytest.mark.integration
 @pytest.mark.postgres
+@pytest.mark.application_fault
 def test_publisher_crash_after_ack_leaves_republishable_outbox(scheduler_engine: Engine) -> None:
     _purge_scheduler_test_data(scheduler_engine)
     event_id = f"r-kafka-01-{uuid4()}"
@@ -167,13 +175,16 @@ def test_publisher_crash_after_ack_leaves_republishable_outbox(scheduler_engine:
             {"id": event_id},
         )
     producer = Producer()
-    crashed = False
-
-    def crash_once(*_: object) -> None:
-        nonlocal crashed
-        if not crashed:
-            crashed = True
-            raise RuntimeError("test crash boundary")
+    injector = ConfiguredFaultInjector(
+        "APP-03",
+        [
+            FaultRule(
+                checkpoint=Checkpoint.PUBLISHER_AFTER_BROKER_ACK,
+                action=FaultAction.RAISE,
+                job_id=event_id,
+            )
+        ],
+    )
 
     try:
         first = OutboxPublisher(
@@ -182,7 +193,7 @@ def test_publisher_crash_after_ack_leaves_republishable_outbox(scheduler_engine:
             owner="publisher-a",
             retry_initial=0.001,
             retry_max=0.001,
-            after_ack=crash_once,
+            fault_injector=injector,
         )
         assert first.run_once() == 1
         with scheduler_engine.begin() as connection:
@@ -203,7 +214,10 @@ def test_publisher_crash_after_ack_leaves_republishable_outbox(scheduler_engine:
             )
 
         second = OutboxPublisher(
-            _sessions(scheduler_engine), producer, owner="publisher-b", after_ack=crash_once
+            _sessions(scheduler_engine),
+            producer,
+            owner="publisher-b",
+            fault_injector=injector,
         )
         assert second.run_once() == 1
         with scheduler_engine.connect() as connection:
@@ -299,6 +313,7 @@ def test_expired_worker_cannot_commit_over_recovered_claim(scheduler_engine: Eng
 
 @pytest.mark.integration
 @pytest.mark.postgres
+@pytest.mark.application_fault
 def test_projection_crash_rolls_back_and_replay_commits_once(edr_engine: Engine) -> None:
     event_id = f"r-proj-01-{uuid4()}"
     job_id = f"job-{event_id}"
@@ -323,12 +338,19 @@ def test_projection_crash_rolls_back_and_replay_commits_once(edr_engine: Engine)
             },
         )
 
-    def crash(_: list[str]) -> None:
-        raise RuntimeError("test pre-commit crash")
-
     factory = _sessions(edr_engine)
-    with pytest.raises(RuntimeError, match="pre-commit"):
-        ProjectionWorker(factory, before_commit=crash).run_once()
+    injector = ConfiguredFaultInjector(
+        "APP-04",
+        [
+            FaultRule(
+                checkpoint=Checkpoint.PROJECTOR_AFTER_APPLY,
+                action=FaultAction.RAISE,
+                job_id=job_id,
+            )
+        ],
+    )
+    with pytest.raises(SyntheticFault):
+        ProjectionWorker(factory, fault_injector=injector).run_once()
     with edr_engine.connect() as connection:
         assert (
             connection.execute(

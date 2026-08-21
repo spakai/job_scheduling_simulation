@@ -9,6 +9,7 @@ from prometheus_client import Counter
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
+from job_visibility.chaos import Checkpoint, FaultContext, FaultInjector, NoOpFaultInjector
 from job_visibility.engine import VisibilityEngine
 from job_visibility.model import Event, EventType
 
@@ -49,9 +50,11 @@ class ProjectionWorker:
         *,
         batch_size: int = 500,
         before_commit: Callable[[list[str]], None] | None = None,
+        fault_injector: FaultInjector | None = None,
     ) -> None:
         self.sessions, self.batch_size = sessions, batch_size
         self.before_commit = before_commit
+        self.fault_injector = fault_injector or NoOpFaultInjector()
 
     def run_once(self) -> int:
         with self.sessions.begin() as session:
@@ -66,12 +69,15 @@ class ProjectionWorker:
                 .all()
             )
             for item in pending:
+                context = FaultContext(job_id=item["job_id"], event_id=item["event_id"])
+                self.fault_injector.inject(Checkpoint.PROJECTOR_BEFORE_APPLY, context)
                 self._project_job(session, item["job_id"])
                 session.execute(
                     text("""INSERT INTO projected_events(event_id,job_id)
                     VALUES (:event_id,:job_id) ON CONFLICT DO NOTHING"""),
                     dict(item),
                 )
+                self.fault_injector.inject(Checkpoint.PROJECTOR_AFTER_APPLY, context)
                 PROJECTED.inc()
             if pending and self.before_commit is not None:
                 self.before_commit([item["event_id"] for item in pending])

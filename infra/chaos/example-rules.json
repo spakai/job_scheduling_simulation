@@ -1,0 +1,10 @@
+[
+  {
+    "checkpoint": "scheduler.after_commit",
+    "action": "raise",
+    "invocations": 1,
+    "activate_on": 1,
+    "job_id": "chaos-app-02",
+    "error_code": "RESPONSE_LOST_AFTER_COMMIT"
+  }
+]

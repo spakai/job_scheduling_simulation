@@ -560,6 +560,8 @@ provider. Deployment outside a trusted development network requires:
 | Use Kafka Connect as the raw EDR journal writer | Accepted and implemented | Keeps scheduler/application code outside the EDR authority. | Connector health, DLQ, and offsets are operational dependencies. |
 | Separate scheduler and visibility API roles | Accepted and implemented | A combined process would need both database credentials. | Clients use port/service-specific write and read endpoints. |
 | Use a standalone fenced polling worker | Accepted and implemented | Multiple replicas can claim bounded disjoint work safely. | Lease, heartbeat, recovery, and backlog age require monitoring. |
+| Use allowlisted application fault checkpoints | Accepted and implemented | Ambiguous commit and acknowledgement failures must be reproducible deterministically. | Chaos composition is disabled by default and forbidden in production. |
+| Restrict resource pressure to chaos-named projects | Accepted and implemented | CPU, memory, and disk experiments otherwise risk unrelated data and processes. | Experiments require isolated Compose projects and finite controls. |
 
 ## 10. Quality requirements
 
@@ -591,6 +593,7 @@ The executable evidence for these requirements is summarized in
 | Representative production load evidence remains incomplete | Capacity and freshness limits remain estimates. | Complete the versioned Spec 003 workload, backlog recovery, and soak gates. |
 | Report files are snapshots | Results can become stale after code changes. | Regenerate them in CI and record the source commit in each report. |
 | Poll interval limits precision | Jobs may start up to one minute late before backlog. | Shorten polling or adopt event/timer wake-up for tighter SLAs. |
+| Resource-pressure matrix is incomplete | OOM, CPU, bandwidth, and disk recovery remain unproved end to end. | Complete Spec 005 nightly assertions using the implemented scoped controls. |
 
 ## 12. Glossary
 

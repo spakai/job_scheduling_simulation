@@ -11,6 +11,8 @@ from prometheus_client import Counter, Gauge
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
+from job_visibility.chaos import Checkpoint, FaultContext, FaultInjector, NoOpFaultInjector
+
 PUBLISHED = Counter("job_visibility_outbox_published_total", "Published lifecycle EDRs")
 FAILED = Counter("job_visibility_outbox_failed_total", "Failed lifecycle EDR publications")
 BACKLOG = Gauge("job_visibility_outbox_leased", "Outbox records leased in the last batch")
@@ -130,12 +132,14 @@ class OutboxPublisher:
         retry_max: float = 60,
         random_source: random.Random | None = None,
         after_ack: Callable[[OutboxRecord, BrokerCoordinate], None] | None = None,
+        fault_injector: FaultInjector | None = None,
     ) -> None:
         self.sessions, self.producer, self.owner = sessions, producer, owner
         self.batch_size, self.lease_seconds = batch_size, lease_seconds
         self.retry_initial, self.retry_max = retry_initial, retry_max
         self.random = random_source or random.Random()
         self.after_ack = after_ack
+        self.fault_injector = fault_injector or NoOpFaultInjector()
         self.stopping = False
 
     def run_once(self) -> int:
@@ -145,11 +149,14 @@ class OutboxPublisher:
         BACKLOG.set(len(records))
         for record in records:
             try:
+                context = FaultContext(job_id=record.message_key, event_id=record.event_id)
+                self.fault_injector.inject(Checkpoint.PUBLISHER_BEFORE_SEND, context)
                 coordinate = self.producer.publish(
                     topic=record.topic, key=record.message_key, value=record.payload
                 )
                 if self.after_ack is not None:
                     self.after_ack(record, coordinate)
+                self.fault_injector.inject(Checkpoint.PUBLISHER_AFTER_BROKER_ACK, context)
                 self._published(record, coordinate)
                 PUBLISHED.inc()
             except Exception as exc:
