@@ -176,6 +176,77 @@ services:
         --data '{"name":"cassandra","listen":"0.0.0.0:9042","upstream":"cassandra:9042"}'
         http://toxiproxy:8474/proxies
 
+  scheduler-api:
+    profiles: ["apps"]
+    build: .
+    command: ["job-visibility-api", "scheduler", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      scheduler-postgres:
+        condition: service_healthy
+    environment:
+      SCHEDULER_DATABASE_URL: postgresql+psycopg://scheduler_owner:scheduler-local@scheduler-postgres:5432/scheduler
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  visibility-api:
+    profiles: ["apps"]
+    build: .
+    command: ["job-visibility-api", "visibility", "--host", "0.0.0.0", "--port", "8001"]
+    depends_on:
+      edr-postgres:
+        condition: service_healthy
+    environment:
+      EDR_DATABASE_URL: postgresql+psycopg://edr_reader:edr-reader-local@edr-postgres:5432/edr
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  scheduler-worker:
+    profiles: ["apps"]
+    build: .
+    command: ["job-visibility-runtime", "scheduler"]
+    depends_on:
+      scheduler-postgres:
+        condition: service_healthy
+    environment:
+      SCHEDULER_DATABASE_URL: postgresql+psycopg://scheduler_owner:scheduler-local@scheduler-postgres:5432/scheduler
+      SCHEDULER_WORKER_OWNER: compose-worker
+
+  outbox-publisher:
+    profiles: ["apps"]
+    build: .
+    command: ["job-visibility-runtime", "publisher"]
+    depends_on:
+      scheduler-postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      SCHEDULER_DATABASE_URL: postgresql+psycopg://scheduler_owner:scheduler-local@scheduler-postgres:5432/scheduler
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+
+  projector:
+    profiles: ["apps"]
+    build: .
+    command: ["job-visibility-runtime", "projector"]
+    depends_on:
+      edr-postgres:
+        condition: service_healthy
+    environment:
+      EDR_DATABASE_URL: postgresql+psycopg://edr_owner:edr-local@edr-postgres:5432/edr
+
 volumes:
   scheduler-postgres-data:
   edr-postgres-data:

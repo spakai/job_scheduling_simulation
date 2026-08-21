@@ -91,6 +91,8 @@ class CassandraConfig(_ConfigGroup):
 class SchedulerTuning(_ConfigGroup):
     batch_size: int = Field(default=100, ge=1)
     claim_lease_seconds: int = Field(default=60, ge=1)
+    poll_interval_seconds: float = Field(default=0.5, gt=0)
+    recovery_batch_size: int = Field(default=100, ge=1)
 
 
 class OutboxTuning(_ConfigGroup):
@@ -134,6 +136,103 @@ def _logical_database(url: SecretStr) -> tuple[str, str, int | None, str]:
     if not parsed.scheme or not parsed.hostname or not database:
         raise ConfigurationError("database URLs must include scheme, host, and database name")
     return parsed.scheme.lower(), parsed.hostname.lower(), parsed.port, database
+
+
+def database_config_from_env(
+    prefix: str, environ: Mapping[str, str] | None = None
+) -> DatabaseConfig:
+    values = os.environ if environ is None else environ
+    url_name = f"{prefix}_DATABASE_URL"
+    if url_name not in values:
+        raise ConfigurationError(f"missing required setting: {url_name}")
+
+    def integer(name: str, default: int) -> int:
+        try:
+            return int(values.get(name, str(default)))
+        except ValueError as exc:
+            raise ConfigurationError(f"{name} must be an integer") from exc
+
+    def number(name: str, default: float) -> float:
+        try:
+            return float(values.get(name, str(default)))
+        except ValueError as exc:
+            raise ConfigurationError(f"{name} must be a number") from exc
+
+    return DatabaseConfig(
+        url=values[url_name],
+        pool_size=integer(f"{prefix}_DATABASE_POOL_SIZE", 5),
+        max_overflow=integer(f"{prefix}_DATABASE_MAX_OVERFLOW", 5),
+        pool_timeout_seconds=number(f"{prefix}_DATABASE_POOL_TIMEOUT_SECONDS", 30),
+        connect_timeout_seconds=integer(f"{prefix}_DATABASE_CONNECT_TIMEOUT_SECONDS", 5),
+        statement_timeout_ms=integer(f"{prefix}_DATABASE_STATEMENT_TIMEOUT_MS", 15_000),
+        lock_timeout_ms=integer(f"{prefix}_DATABASE_LOCK_TIMEOUT_MS", 5_000),
+        idle_transaction_timeout_ms=integer(
+            f"{prefix}_DATABASE_IDLE_TRANSACTION_TIMEOUT_MS", 30_000
+        ),
+        transaction_timeout_ms=integer(f"{prefix}_DATABASE_TRANSACTION_TIMEOUT_MS", 30_000),
+    )
+
+
+def scheduler_tuning_from_env(
+    environ: Mapping[str, str] | None = None,
+) -> SchedulerTuning:
+    values = os.environ if environ is None else environ
+    try:
+        return SchedulerTuning(
+            batch_size=int(values.get("SCHEDULER_BATCH_SIZE", "100")),
+            claim_lease_seconds=int(values.get("SCHEDULER_CLAIM_LEASE_SECONDS", "60")),
+            poll_interval_seconds=float(values.get("SCHEDULER_POLL_INTERVAL_SECONDS", "0.5")),
+            recovery_batch_size=int(values.get("SCHEDULER_RECOVERY_BATCH_SIZE", "100")),
+        )
+    except ValueError as exc:
+        raise ConfigurationError("scheduler tuning values must be numeric") from exc
+
+
+def kafka_config_from_env(environ: Mapping[str, str] | None = None) -> KafkaConfig:
+    values = os.environ if environ is None else environ
+    try:
+        return KafkaConfig(
+            bootstrap_servers=values.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
+            edr_topic=values.get("KAFKA_EDR_TOPIC", "job-lifecycle-edr.v1"),
+            edr_dlq_topic=values.get("KAFKA_EDR_DLQ_TOPIC", "job-lifecycle-edr-dlq.v1"),
+            consumer_group=values.get("KAFKA_CONSUMER_GROUP", "job-visibility-projector-v1"),
+            schema_registry_url=values.get("SCHEMA_REGISTRY_URL", "http://localhost:8081"),
+            socket_timeout_ms=int(values.get("KAFKA_SOCKET_TIMEOUT_MS", "10000")),
+            request_timeout_ms=int(values.get("KAFKA_REQUEST_TIMEOUT_MS", "10000")),
+            delivery_timeout_ms=int(values.get("KAFKA_DELIVERY_TIMEOUT_MS", "30000")),
+            metadata_timeout_ms=int(values.get("KAFKA_METADATA_TIMEOUT_MS", "10000")),
+            flush_timeout_seconds=float(values.get("KAFKA_FLUSH_TIMEOUT_SECONDS", "10")),
+            schema_registry_connect_timeout_seconds=float(
+                values.get("SCHEMA_REGISTRY_CONNECT_TIMEOUT_SECONDS", "5")
+            ),
+            schema_registry_read_timeout_seconds=float(
+                values.get("SCHEMA_REGISTRY_READ_TIMEOUT_SECONDS", "10")
+            ),
+        )
+    except ValueError as exc:
+        raise ConfigurationError("Kafka tuning values must be numeric") from exc
+
+
+def outbox_tuning_from_env(environ: Mapping[str, str] | None = None) -> OutboxTuning:
+    values = os.environ if environ is None else environ
+    try:
+        return OutboxTuning(
+            batch_size=int(values.get("OUTBOX_BATCH_SIZE", "100")),
+            retry_initial_seconds=float(values.get("OUTBOX_RETRY_INITIAL_SECONDS", "1")),
+            retry_max_seconds=float(values.get("OUTBOX_RETRY_MAX_SECONDS", "60")),
+        )
+    except ValueError as exc:
+        raise ConfigurationError("outbox tuning values must be numeric") from exc
+
+
+def projection_tuning_from_env(environ: Mapping[str, str] | None = None) -> ProjectionTuning:
+    values = os.environ if environ is None else environ
+    try:
+        return ProjectionTuning(
+            batch_size=int(values.get("PROJECTION_BATCH_SIZE", "500")),
+        )
+    except ValueError as exc:
+        raise ConfigurationError("projection tuning values must be numeric") from exc
 
 
 class AppConfig(_ConfigGroup):
@@ -244,6 +343,8 @@ class AppConfig(_ConfigGroup):
             scheduler=SchedulerTuning(
                 batch_size=integer("SCHEDULER_BATCH_SIZE", 100),
                 claim_lease_seconds=integer("SCHEDULER_CLAIM_LEASE_SECONDS", 60),
+                poll_interval_seconds=number("SCHEDULER_POLL_INTERVAL_SECONDS", 0.5),
+                recovery_batch_size=integer("SCHEDULER_RECOVERY_BATCH_SIZE", 100),
             ),
             outbox=OutboxTuning(
                 batch_size=integer("OUTBOX_BATCH_SIZE", 100),

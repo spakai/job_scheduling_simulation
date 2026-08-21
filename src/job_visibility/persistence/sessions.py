@@ -33,7 +33,7 @@ class DurableSessions:
         self.edr.dispose()
 
 
-def _build_database(config: DatabaseConfig, *, role: str) -> DatabaseSessions:
+def build_database_sessions(config: DatabaseConfig, *, role: str) -> DatabaseSessions:
     server_options = " ".join(
         (
             f"-c statement_timeout={config.statement_timeout_ms}",
@@ -61,6 +61,6 @@ def _build_database(config: DatabaseConfig, *, role: str) -> DatabaseSessions:
 def build_durable_sessions(config: AppConfig) -> DurableSessions:
     """Build role-specific pools without opening a database connection."""
     return DurableSessions(
-        scheduler=_build_database(config.scheduler_database, role="scheduler"),
-        edr=_build_database(config.edr_database, role="edr"),
+        scheduler=build_database_sessions(config.scheduler_database, role="scheduler"),
+        edr=build_database_sessions(config.edr_database, role="edr"),
     )

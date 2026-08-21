@@ -3,8 +3,10 @@ name: Resilience
 on:
   pull_request:
     paths:
+      - "Dockerfile"
       - "compose.yaml"
       - "infra/**"
+      - "scripts/**"
       - "migrations/**"
       - "src/job_visibility/**"
       - "tests/integration/**"
@@ -26,7 +28,7 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: docker compose --project-name job-visibility-ci up -d scheduler-postgres edr-postgres
       - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/infra ready-postgres
-      - run: scripts/infra migrate
+      - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/infra migrate
       - run: scripts/infra test-postgres
       - if: failure()
         run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/collect-test-evidence resilience-results/postgres
@@ -37,6 +39,29 @@ jobs:
           path: resilience-results/postgres
       - if: always()
         run: docker compose --project-name job-visibility-ci down --volumes --remove-orphans
+
+  production-http:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e '.[dev]'
+      - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-http scripts/infra bootstrap
+      - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-http scripts/infra up-apps
+      - run: scripts/infra smoke-http
+      - if: failure()
+        run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-http scripts/collect-test-evidence resilience-results/http
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-http-evidence
+          path: resilience-results/http
+      - if: always()
+        run: docker compose --project-name job-visibility-http --profile apps down --volumes --remove-orphans
 
   nightly-resilience:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
