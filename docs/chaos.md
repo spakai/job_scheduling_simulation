@@ -296,6 +296,18 @@ connection to scheduler, the Cassandra worker could not manage schema, and a dif
 
 ## Current gaps
 
+### Spec 005 resource pressure and application failpoints
+
+Spec 005 adds a no-op-by-default fault injector at scheduler commit, worker claim/completion,
+publisher acknowledgement, projector apply, and visibility query boundaries. `APP-01` through
+`APP-04` and the `NET-01`/`NET-03` PostgreSQL degradation scenarios are automated. Scoped
+CPU, memory, and disposable disk controls are available only for `job-visibility-chaos-*`
+projects.
+
+The remaining evidence gap is not the ability to create pressure: it is proving the complete
+OOM, CPU, bandwidth, and disk hypothesis/recovery matrices under bounded nightly workloads.
+See [`spec-005-evidence.md`](spec-005-evidence.md).
+
 Spec 003 tracks production hardening and evidence. The implementation status is:
 
 | Item | Status |

@@ -22,6 +22,11 @@ if command -v docker >/dev/null 2>&1; then
     sanitize >"$output_dir/compose-ps.txt" || true
   docker compose --project-name "$project_name" logs --no-color --timestamps 2>&1 |
     sanitize >"$output_dir/compose.log" || true
+  docker stats --no-stream --format '{{json .}}' 2>&1 |
+    sanitize >"$output_dir/container-stats.jsonl" || true
+  for container_id in $(docker compose --project-name "$project_name" ps -q 2>/dev/null); do
+    docker inspect --format '{{json .State}}' "$container_id" 2>&1 || true
+  done | sanitize >"$output_dir/container-states.jsonl"
 fi
 
 curl -fsS http://localhost:8083/connectors/edr-jdbc-sink-v1/status 2>&1 |

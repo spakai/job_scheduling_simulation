@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
+from job_visibility.chaos import Checkpoint, FaultContext, FaultInjector, NoOpFaultInjector
+
 from .service import SchedulerService
 
 
@@ -18,6 +20,7 @@ class SchedulerWorker:
         recovery_batch_size: int = 100,
         poll_interval_seconds: float = 0.5,
         wait: Callable[[float], None] = time.sleep,
+        fault_injector: FaultInjector | None = None,
     ) -> None:
         if not owner:
             raise ValueError("scheduler worker owner is required")
@@ -29,12 +32,20 @@ class SchedulerWorker:
         self.recovery_batch_size = recovery_batch_size
         self.poll_interval_seconds = poll_interval_seconds
         self.wait = wait
+        self.fault_injector = fault_injector or NoOpFaultInjector()
         self._stopping = False
 
     def run_once(self) -> int:
         self.scheduler.recover_expired_claims(limit=self.recovery_batch_size)
         claimed = self.scheduler.claim_due(owner=self.owner, limit=self.batch_size)
         for job in claimed:
+            self.fault_injector.inject(
+                Checkpoint.WORKER_AFTER_CLAIM,
+                FaultContext(
+                    job_id=getattr(job, "job_id", None),
+                    correlation_id=getattr(job, "correlation_id", None),
+                ),
+            )
             if self._stopping:
                 break
             self.scheduler.execute(job)

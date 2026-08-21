@@ -5,6 +5,7 @@ import os
 import socket
 import time
 
+from job_visibility.chaos import fault_injector_from_env
 from job_visibility.config import (
     database_config_from_env,
     kafka_config_from_env,
@@ -23,6 +24,7 @@ def main() -> None:
     parser.add_argument("role", choices=("scheduler", "publisher", "projector", "rebuild"))
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
+    fault_injector = fault_injector_from_env()
     if args.role == "scheduler":
         tuning = scheduler_tuning_from_env()
         database = build_database_sessions(
@@ -31,6 +33,7 @@ def main() -> None:
         scheduler = SchedulerService(
             database.session_factory,
             claim_lease_seconds=tuning.claim_lease_seconds,
+            fault_injector=fault_injector,
         )
         worker = SchedulerWorker(
             scheduler,
@@ -38,6 +41,7 @@ def main() -> None:
             batch_size=tuning.batch_size,
             recovery_batch_size=tuning.recovery_batch_size,
             poll_interval_seconds=tuning.poll_interval_seconds,
+            fault_injector=fault_injector,
         )
         try:
             if args.once:
@@ -75,10 +79,15 @@ def main() -> None:
                 batch_size=outbox.batch_size,
                 retry_initial=outbox.retry_initial_seconds,
                 retry_max=outbox.retry_max_seconds,
+                fault_injector=fault_injector,
             )
         else:
             projection = projection_tuning_from_env()
-            worker = ProjectionWorker(database.session_factory, batch_size=projection.batch_size)
+            worker = ProjectionWorker(
+                database.session_factory,
+                batch_size=projection.batch_size,
+                fault_injector=fault_injector,
+            )
             if args.role == "rebuild":
                 print(worker.rebuild())
                 return

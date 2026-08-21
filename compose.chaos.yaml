@@ -1,0 +1,35 @@
+services:
+  scheduler-api:
+    depends_on:
+      toxiproxy-setup:
+        condition: service_completed_successfully
+    environment:
+      SCHEDULER_DATABASE_URL: postgresql+psycopg://scheduler_owner:scheduler-local@toxiproxy:15432/scheduler
+
+  scheduler-worker:
+    depends_on:
+      toxiproxy-setup:
+        condition: service_completed_successfully
+    environment:
+      SCHEDULER_DATABASE_URL: postgresql+psycopg://scheduler_owner:scheduler-local@toxiproxy:15432/scheduler
+
+  outbox-publisher:
+    depends_on:
+      toxiproxy-setup:
+        condition: service_completed_successfully
+    environment:
+      SCHEDULER_DATABASE_URL: postgresql+psycopg://scheduler_owner:scheduler-local@toxiproxy:15432/scheduler
+
+  visibility-api:
+    depends_on:
+      toxiproxy-setup:
+        condition: service_completed_successfully
+    environment:
+      EDR_DATABASE_URL: postgresql+psycopg://edr_reader:edr-reader-local@toxiproxy:15433/edr
+
+  projector:
+    depends_on:
+      toxiproxy-setup:
+        condition: service_completed_successfully
+    environment:
+      EDR_DATABASE_URL: postgresql+psycopg://edr_owner:edr-local@toxiproxy:15433/edr

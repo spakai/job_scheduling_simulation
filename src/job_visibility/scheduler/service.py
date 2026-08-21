@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
+from job_visibility.chaos import Checkpoint, FaultContext, FaultInjector, NoOpFaultInjector
 from job_visibility.model import Event, EventType
 from job_visibility.outbox import canonical_edr
 
@@ -36,18 +37,21 @@ class SchedulerService:
         claim_lease_seconds: int = 60,
         retry_delay: Callable[[int], timedelta] | None = None,
         handlers: HandlerRegistry | None = None,
+        fault_injector: FaultInjector | None = None,
     ) -> None:
         self.sessions = sessions
         self.topic = topic
         self.claim_lease_seconds = claim_lease_seconds
         self.retry_delay = retry_delay or (lambda attempt: timedelta(seconds=min(300, 2**attempt)))
         self.handlers = handlers or HandlerRegistry()
+        self.fault_injector = fault_injector or NoOpFaultInjector()
 
     def submit(self, value: JobSubmission) -> bool:
         return self.submit_checked(value) is SubmissionDecision.CREATED
 
     def submit_checked(self, value: JobSubmission) -> SubmissionDecision:
-        with self.sessions.begin() as session:
+        context = FaultContext(job_id=value.job_id, correlation_id=value.correlation_id)
+        with self.sessions() as session, session.begin():
             inserted = session.execute(
                 text("""
                 INSERT INTO scheduler_jobs
@@ -90,7 +94,9 @@ class SchedulerService:
             common = self._event_values(value, inserted)
             self._add_event(session, EventType.JOB_CREATED, **common)
             self._add_event(session, EventType.JOB_SCHEDULER_SUBMISSION_REQUESTED, **common)
-            return SubmissionDecision.CREATED
+            self.fault_injector.inject(Checkpoint.SCHEDULER_BEFORE_COMMIT, context)
+        self.fault_injector.inject(Checkpoint.SCHEDULER_AFTER_COMMIT, context)
+        return SubmissionDecision.CREATED
 
     def claim_due(self, *, owner: str, limit: int) -> list[ClaimedJob]:
         if limit < 1:
@@ -263,6 +269,10 @@ class SchedulerService:
                 job, HandlerError("UNEXPECTED_HANDLER_ERROR", "handler failed", retryable=True)
             )
             return None
+        self.fault_injector.inject(
+            Checkpoint.WORKER_BEFORE_COMPLETE,
+            FaultContext(job_id=job.job_id, correlation_id=job.correlation_id),
+        )
         self.succeed(job, result)
         return result
 

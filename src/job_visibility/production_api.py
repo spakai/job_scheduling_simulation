@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from job_visibility.api import create_app
+from job_visibility.chaos import fault_injector_from_env
 from job_visibility.config import database_config_from_env, scheduler_tuning_from_env
 from job_visibility.edr_store import DurableVisibilityReader
 from job_visibility.observability import HealthService
@@ -32,9 +33,11 @@ def _retain_paths(app: FastAPI, prefixes: tuple[str, ...]) -> FastAPI:
 def create_scheduler_app() -> FastAPI:
     database = build_database_sessions(database_config_from_env("SCHEDULER"), role="scheduler-api")
     tuning = scheduler_tuning_from_env()
+    fault_injector = fault_injector_from_env()
     scheduler = SchedulerService(
         database.session_factory,
         claim_lease_seconds=tuning.claim_lease_seconds,
+        fault_injector=fault_injector,
     )
     health = HealthService(database.session_factory)
 
@@ -58,7 +61,10 @@ def create_scheduler_app() -> FastAPI:
 
 def create_visibility_app() -> FastAPI:
     database = build_database_sessions(database_config_from_env("EDR"), role="visibility-api")
-    reader = DurableVisibilityReader(database.session_factory)
+    reader = DurableVisibilityReader(
+        database.session_factory,
+        fault_injector=fault_injector_from_env(),
+    )
     health = HealthService(edr=database.session_factory)
 
     @asynccontextmanager

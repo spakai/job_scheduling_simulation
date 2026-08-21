@@ -30,6 +30,7 @@ dev = [
 job-visibility-sim = "job_visibility.cli:main"
 job-visibility-runtime = "job_visibility.runtime:main"
 job-visibility-api = "job_visibility.production_api:main"
+job-visibility-chaos = "job_visibility.chaos.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -44,6 +45,9 @@ markers = [
   "postgres: requires the scheduler and EDR PostgreSQL databases",
   "cassandra: requires Cassandra and the fault proxy",
   "e2e: requires the complete Spec 002 stack",
+  "chaos: requires an isolated Spec 005 chaos topology",
+  "resource: requires container resource-control capabilities",
+  "application_fault: exercises deterministic application failpoints",
 ]
 
 [tool.ruff]
