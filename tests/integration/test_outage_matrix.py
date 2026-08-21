@@ -240,9 +240,7 @@ def test_event_identity_collision_is_immutable_and_partition_continues(
             interval_seconds=0.25,
         )
 
-        ingress.publish(
-            Event(collision_id, EventType.JOB_CANCELLED, now, now, collision_job_id)
-        )
+        ingress.publish(Event(collision_id, EventType.JOB_CANCELLED, now, now, collision_job_id))
         ingress.publish(Event(following_id, EventType.JOB_CREATED, now, now, following_job_id))
 
         assert _wait_for_dlq_key(consumer, collision_job_id) == collision_job_id

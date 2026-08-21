@@ -8,6 +8,14 @@ compose=(docker compose --project-name "$project_name")
 scheduler_url=${SCHEDULER_DATABASE_URL:-postgresql+psycopg://scheduler_owner:scheduler-local@localhost:5432/scheduler}
 edr_url=${EDR_DATABASE_URL:-postgresql+psycopg://edr_owner:edr-local@localhost:5433/edr}
 deadline_seconds=${INFRA_READY_TIMEOUT_SECONDS:-300}
+python_command=${PYTHON_COMMAND:-}
+if [[ -z "$python_command" ]]; then
+  if [[ -x .venv/bin/python ]]; then
+    python_command=.venv/bin/python
+  else
+    python_command=python3
+  fi
+fi
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -67,8 +75,8 @@ ready_postgres() {
 }
 
 migrate() {
-  SCHEDULER_DATABASE_URL=$scheduler_url .venv/bin/alembic -n scheduler upgrade head
-  EDR_DATABASE_URL=$edr_url .venv/bin/alembic -n edr upgrade head
+  SCHEDULER_DATABASE_URL=$scheduler_url "$python_command" -m alembic -n scheduler upgrade head
+  EDR_DATABASE_URL=$edr_url "$python_command" -m alembic -n edr upgrade head
 }
 
 diagnostics() {
@@ -101,12 +109,12 @@ case "$command_name" in
     ;;
   test-postgres)
     RUN_POSTGRES_TESTS=1 SCHEDULER_DATABASE_URL=$scheduler_url EDR_DATABASE_URL=$edr_url \
-      .venv/bin/pytest -m postgres "$@"
+      "$python_command" -m pytest -m postgres "$@"
     ;;
   test-resilience)
     RUN_RESILIENCE_TESTS=1 RUN_OUTAGE_TESTS=${RUN_OUTAGE_TESTS:-0} \
       SCHEDULER_DATABASE_URL=$scheduler_url EDR_DATABASE_URL=$edr_url \
-      .venv/bin/pytest -m 'integration or e2e' "$@"
+      "$python_command" -m pytest -m 'integration or e2e' "$@"
     ;;
   diagnostics)
     diagnostics
