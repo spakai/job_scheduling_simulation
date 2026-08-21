@@ -28,7 +28,7 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: docker compose --project-name job-visibility-ci up -d scheduler-postgres edr-postgres
       - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/infra ready-postgres
-      - run: scripts/infra migrate
+      - run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/infra migrate
       - run: scripts/infra test-postgres
       - if: failure()
         run: JOB_VISIBILITY_COMPOSE_PROJECT=job-visibility-ci scripts/collect-test-evidence resilience-results/postgres
