@@ -15,4 +15,4 @@ def test_outage_controller_rejects_unapproved_services() -> None:
     controller = ComposeOutageController("job-visibility-test", workdir=Path.cwd())
 
     with pytest.raises(ValueError, match="not approved"):
-        controller.stop("cassandra")
+        controller.stop("schema-registry")

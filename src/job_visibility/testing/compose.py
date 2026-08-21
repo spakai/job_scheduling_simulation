@@ -9,7 +9,13 @@ from typing import Any
 from .polling import poll_until
 
 _PROJECT = re.compile(r"^job-visibility-[a-z0-9-]+$")
-_SERVICES = {"scheduler-postgres", "edr-postgres", "kafka"}
+_SERVICES = {
+    "scheduler-postgres",
+    "edr-postgres",
+    "kafka",
+    "kafka-connect",
+    "cassandra",
+}
 
 
 class ComposeOutageController:

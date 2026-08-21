@@ -33,16 +33,24 @@ The opt-in suites provide executable coverage for:
 | Cassandra post-finalize lost response | `test_post_finalize_response_loss_reconciles_exactly_once` |
 | Forced same-checksum two-worker conflict | `test_two_workers_force_one_checksum_conflict_then_apply_distinct_operations_once` |
 | Kafka/Schema Registry/Connect/EDR path | `test_real_kafka_connect_path_persists_canonical_edr` |
+| Poison record DLQ and partition continuation | `test_poison_record_reaches_dlq_and_subsequent_record_progresses` |
+| Event identity collision immutability and continuation | `test_event_identity_collision_is_immutable_and_partition_continues` |
+| Kafka Connect stop/start with buffered replay | `test_connect_restart_replays_buffered_record` |
 
 The local Docker execution on 2026-08-21 produced:
 
 - PostgreSQL subset: 8 passed in 0.75 seconds.
-- Full resilience and outage subset: 15 passed in 74.82 seconds.
+- Full resilience and outage subset after adding DLQ continuation and Connect restart:
+  18 passed in 79.65 seconds.
 - Broker recovery required a normal Connect consumer-group rebalance; the bounded test
   observed outbox drain followed by persistence of both buffered EDRs.
 - Scheduler and EDR database stop/start isolation passed in both directions.
 - EDR database outage buffered a valid event in Kafka and persisted it after database
   recovery.
+- A malformed converter input and a conflicting event identity reached the DLQ; valid records
+  following each fault persisted successfully and the original collision row remained unchanged.
+- A record published while Kafka Connect was stopped persisted after Connect restarted and
+  resumed from its Kafka offsets.
 
 The `Resilience` workflow runs the PostgreSQL subset on relevant pull requests and the full
 current infrastructure subset nightly or by manual dispatch. Failures upload redacted
@@ -69,7 +77,7 @@ depends only on and writes only to `edr-postgres`.
 The following work cannot be claimed complete until run on real infrastructure:
 
 - repeat the live matrix in hosted CI and address any platform-specific instability;
-- automate poison-record continuation and identity-collision DLQ assertions;
+- repeat poison-record continuation and identity-collision DLQ assertions in hosted CI;
 - complete the component pre/post-commit restart matrix;
 - implement the durable representative-load driver;
 - agree the resource envelope for `representative-v1`; and

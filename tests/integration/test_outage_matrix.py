@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from confluent_kafka import Consumer, KafkaError, Producer
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
@@ -178,6 +179,116 @@ def test_edr_outage_buffers_in_kafka_and_catches_up(edr_engine: Engine) -> None:
         producer.close(5)
 
 
+@pytest.mark.integration
+@pytest.mark.kafka
+@pytest.mark.e2e
+def test_poison_record_reaches_dlq_and_subsequent_record_progresses(edr_engine: Engine) -> None:
+    """SINK-02: a converter failure must not wedge the connector partition."""
+    poison_key = f"r-sink-02-poison-{uuid4()}"
+    valid_event_id = f"r-sink-02-valid-{uuid4()}"
+    valid_job_id = f"job-{valid_event_id}"
+    consumer = _dlq_consumer()
+    raw_producer = Producer({"bootstrap.servers": _bootstrap_servers()})
+    producer = _producer()
+    now = datetime.now(UTC)
+    try:
+        raw_producer.produce(
+            "job-lifecycle-edr.v1",
+            key=poison_key.encode(),
+            value=b"not-schema-registry-framed-json",
+        )
+        assert raw_producer.flush(10) == 0
+        KafkaEdrIngress(producer, topic="job-lifecycle-edr.v1").publish(
+            Event(valid_event_id, EventType.JOB_CREATED, now, now, valid_job_id)
+        )
+
+        assert _wait_for_dlq_key(consumer, poison_key) == poison_key
+        assert poll_until(
+            lambda: _event_exists(edr_engine, valid_event_id),
+            bool,
+            description="valid EDR after poison record",
+            timeout_seconds=45,
+            interval_seconds=0.25,
+        )
+    finally:
+        consumer.close()
+        producer.close(5)
+
+
+@pytest.mark.integration
+@pytest.mark.kafka
+@pytest.mark.e2e
+def test_event_identity_collision_is_immutable_and_partition_continues(
+    edr_engine: Engine,
+) -> None:
+    """SINK-03: a conflicting event ID is quarantined without mutating authority."""
+    collision_id = f"r-sink-03-collision-{uuid4()}"
+    collision_job_id = f"job-{collision_id}"
+    following_id = f"r-sink-03-following-{uuid4()}"
+    following_job_id = f"job-{following_id}"
+    consumer = _dlq_consumer()
+    producer = _producer()
+    ingress = KafkaEdrIngress(producer, topic="job-lifecycle-edr.v1")
+    now = datetime.now(UTC)
+    try:
+        ingress.publish(Event(collision_id, EventType.JOB_CREATED, now, now, collision_job_id))
+        assert poll_until(
+            lambda: _event_type(edr_engine, collision_id),
+            lambda value: value == EventType.JOB_CREATED.value,
+            description="original collision candidate to persist",
+            timeout_seconds=30,
+            interval_seconds=0.25,
+        )
+
+        ingress.publish(
+            Event(collision_id, EventType.JOB_CANCELLED, now, now, collision_job_id)
+        )
+        ingress.publish(Event(following_id, EventType.JOB_CREATED, now, now, following_job_id))
+
+        assert _wait_for_dlq_key(consumer, collision_job_id) == collision_job_id
+        assert _event_type(edr_engine, collision_id) == EventType.JOB_CREATED.value
+        assert poll_until(
+            lambda: _event_exists(edr_engine, following_id),
+            bool,
+            description="valid EDR after identity collision",
+            timeout_seconds=45,
+            interval_seconds=0.25,
+        )
+    finally:
+        consumer.close()
+        producer.close(5)
+
+
+@pytest.mark.integration
+@pytest.mark.kafka
+@pytest.mark.e2e
+def test_connect_restart_replays_buffered_record(edr_engine: Engine) -> None:
+    """Restart matrix: Connect resumes from Kafka after a process restart."""
+    controller = _controller()
+    event_id = f"r-restart-connect-{uuid4()}"
+    job_id = f"job-{event_id}"
+    producer = _producer()
+    now = datetime.now(UTC)
+    controller.stop("kafka-connect")
+    try:
+        KafkaEdrIngress(producer, topic="job-lifecycle-edr.v1").publish(
+            Event(event_id, EventType.JOB_CREATED, now, now, job_id)
+        )
+        assert not _event_exists(edr_engine, event_id)
+    finally:
+        controller.start("kafka-connect")
+    try:
+        assert poll_until(
+            lambda: _event_exists(edr_engine, event_id),
+            bool,
+            description="Connect to replay after restart",
+            timeout_seconds=60,
+            interval_seconds=0.25,
+        )
+    finally:
+        producer.close(5)
+
+
 def _producer(*, delivery_timeout_ms: int = 10_000) -> ConfluentBrokerProducer:
     return ConfluentBrokerProducer(
         os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
@@ -186,6 +297,57 @@ def _producer(*, delivery_timeout_ms: int = 10_000) -> ConfluentBrokerProducer:
         request_timeout_ms=min(1_000, delivery_timeout_ms),
         delivery_timeout_ms=delivery_timeout_ms,
         metadata_timeout_ms=min(1_000, delivery_timeout_ms),
+    )
+
+
+def _bootstrap_servers() -> str:
+    return os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+
+
+def _dlq_consumer() -> Consumer:
+    consumer = Consumer(
+        {
+            "bootstrap.servers": _bootstrap_servers(),
+            "group.id": f"resilience-dlq-{uuid4()}",
+            "auto.offset.reset": "latest",
+            "enable.auto.commit": False,
+        }
+    )
+    consumer.subscribe([os.getenv("KAFKA_EDR_DLQ_TOPIC", "job-lifecycle-edr-dlq.v1")])
+
+    def assigned() -> list[object]:
+        consumer.poll(0.1)
+        return consumer.assignment()
+
+    # Force assignment before producing so "latest" cannot skip the test record.
+    poll_until(
+        assigned,
+        bool,
+        description="DLQ consumer partition assignment",
+        timeout_seconds=15,
+        interval_seconds=0.1,
+    )
+    return consumer
+
+
+def _wait_for_dlq_key(consumer: Consumer, expected_key: str) -> str:
+    def receive() -> str | None:
+        message = consumer.poll(0.25)
+        if message is None:
+            return None
+        if message.error():
+            if message.error().code() == KafkaError._PARTITION_EOF:
+                return None
+            raise RuntimeError(message.error())
+        key = message.key()
+        return key.decode() if key else ""
+
+    return poll_until(
+        receive,
+        lambda key: key == expected_key,
+        description=f"DLQ record with key {expected_key}",
+        timeout_seconds=45,
+        interval_seconds=0.01,
     )
 
 
@@ -217,3 +379,11 @@ def _event_exists(engine: Engine, event_id: str) -> bool:
                 {"event": event_id},
             ).scalar_one()
         )
+
+
+def _event_type(engine: Engine, event_id: str) -> str | None:
+    with engine.connect() as connection:
+        return connection.execute(
+            text("SELECT event_type FROM edr_events WHERE event_id=:event"),
+            {"event": event_id},
+        ).scalar_one_or_none()
