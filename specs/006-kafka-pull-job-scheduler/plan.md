@@ -194,12 +194,17 @@ Tasks:
    revoke, and commit transitions.
 8. Add a no-side-effect handler to prove multi-pod partition sharing and owner affinity
    against real Kafka.
+9. Add an offset-gap test where 100 and 102 finish while 101 blocks; assert the committed
+   next offset remains 101 until 101 completes.
+10. Add a same-group assignment test proving two stable consumers never simultaneously own
+    one partition, plus an isolated different-group test demonstrating that both groups
+    independently receive the record.
 
 Exit criteria:
 
 - No offset is committed at fetch, queue, or start.
 - Concurrent completion commits only the highest contiguous safe offset.
-- Each partition has at most one active group owner.
+- Each partition has at most one current consumer owner within the worker `group.id`.
 - Two jobs with the same `ownerId` never execute concurrently; different owners sharing a
   partition may do so safely.
 
@@ -216,6 +221,10 @@ Tasks:
    duplicates.
 7. Thread a stable operation idempotency key into every handler contract.
 8. Adapt built-in handlers to demonstrate idempotent or conditional side effects.
+9. Hold an external call open across partition revocation, transfer the partition to a new
+   pod, and assert the former generation cannot commit Kafka outputs or offsets.
+10. Redeliver the held job to the new pod with the same operation id and assert the external
+    dependency returns the original idempotent outcome.
 
 Exit criteria:
 
@@ -260,12 +269,16 @@ Tasks:
    revocation.
 9. Add audited manual replay tooling that emits a new work record with the original
    `ownerId` key without editing history.
+10. Implement `PULL-REB-02`, `PULL-OFF-01`, and `PULL-GRP-01` with recorded assignments,
+    generations, transaction fencing, offset history, and external operation IDs.
 
 Exit criteria:
 
 - Retry and DLQ offsets never advance without their complete required output set.
 - Forced termination and rebalance lose no acknowledged work.
 - Exhausted poison records cannot block a partition indefinitely.
+- A revoked pod cannot commit under a stale generation, and a new pod safely redelivers any
+  uncommitted work.
 
 ### Phase 6 — Operations, deployment, and evidence
 
@@ -285,7 +298,8 @@ Tasks:
 8. Run `PULL-CAP-01` through `PULL-CAP-04` for 24-hour-equivalent, one-hour, ten-minute,
    and one-minute arrival curves.
 9. Run `PULL-SKEW-01` with one owner carrying 50% of requests and assert zero owner overlap.
-10. Run `PULL-POD-01`, `PULL-BP-01`, and `PULL-REB-01` during the ten-minute burst profile.
+10. Run `PULL-POD-01`, `PULL-BP-01`, `PULL-REB-01`, and `PULL-REB-02` during the ten-minute
+    burst profile; include `PULL-OFF-01` and isolated `PULL-GRP-01` in nightly evidence.
 11. Compare six and twelve partitions when six misses the declared latency or recovery
     objective; retain the chosen count and evidence as a release decision.
 12. Run broker outage, network ambiguity, pod kill, rebalance storm, and output-topic outage
@@ -331,9 +345,10 @@ Exit criteria:
 | --- | --- | --- | --- |
 | Contracts/keying | Schema, immutable fields, canonical owner keys | Registry compatibility and same-owner affinity | Partition expansion/owner-skew review |
 | Producer | Ack/timeout mapping | Real broker acknowledgement | Ambiguous timeout and retry |
-| Offsets | Contiguous tracker | Multi-partition manual commits | Crash/revoke at every boundary |
-| Transactions | State machine | `read_committed` atomic visibility | Abort, timeout, fencing |
+| Offsets | Contiguous tracker and offset gaps | Multi-partition manual commits | Block 101 while 100/102 finish; crash/revoke boundaries |
+| Transactions | State machine | `read_committed` atomic visibility | Abort, timeout, stale-generation fencing |
 | Idempotency | Duplicate/conflict reducer | State restore and reassignment | Crash after external effect |
+| Consumer ownership | Assignment generation | One partition owner per group | Same-group rebalance and isolated split-group duplicate proof |
 | Owner serialization | Keyed gate | Same owner never overlaps | Hot-owner load and rebalance |
 | TPS | Virtual-clock token bucket | Per-pod measured rate | Replica scale and bursts |
 | Backpressure | Transition model | Pause with heartbeat polls | Output-topic outage/recovery |
@@ -348,7 +363,8 @@ CI tiers are:
 1. **Pull request:** unit tests, schema compatibility, static config/ACL validation, and a
    bounded single-broker transaction suite.
 2. **Nightly:** `PULL-CAP-01` through `PULL-CAP-04`, `PULL-SKEW-01`, `PULL-POD-01`,
-   `PULL-BP-01`, `PULL-REB-01`, multi-broker Kafka, state restore, and TPS scenarios.
+   `PULL-BP-01`, `PULL-REB-01`, `PULL-REB-02`, `PULL-OFF-01`, isolated `PULL-GRP-01`,
+   multi-broker Kafka, state restore, and TPS scenarios.
 3. **Release:** nightly suite plus repeated migration/rollback rehearsal and representative
    capacity evidence.
 

@@ -260,6 +260,31 @@ Revocation stops dispatch for affected partitions. The pod drains only to a boun
 deadline and commits the highest contiguous safe offset; unfinished work is abandoned for
 redelivery. Shutdown first fails readiness, then follows the same bounded drain path.
 
+Kafka assigns a partition to at most one consumer in the same `group.id` during stable
+operation. During reassignment, however, the former pod may still have an external call in
+flight after the new pod receives the partition. Offset ownership alone cannot cancel that
+call, so generation fencing protects Kafka writes and the shared job/operation idempotency
+key protects the external effect.
+
+```mermaid
+sequenceDiagram
+    participant A as Former pod A
+    participant K as Kafka group coordinator
+    participant B as New pod B
+    participant D as Business dependency
+
+    A->>D: Execute job with operation id
+    K->>A: Revoke partition
+    A->>A: Stop dispatch and begin bounded drain
+    K->>B: Assign partition at new generation
+    B->>K: Read from last committed offset
+    A-->>K: Late transaction from stale generation
+    K--xA: Fence or reject stale transaction
+    B->>D: Redeliver with same operation id
+    D-->>B: Existing idempotent outcome
+    B->>K: Commit outputs and source offset transactionally
+```
+
 ## 7. Deployment View
 
 ```mermaid
@@ -297,6 +322,12 @@ termination grace. Autoscaling uses lag/age but caps replicas and therefore aggr
 Auto-commit is disabled. Output records and consumed offsets use Kafka transactions and
 `read_committed` readers. Concurrent partition processing advances only through contiguous
 completed offsets. Transactional IDs are unique and fenced across pod generations.
+
+Two pods using different Kafka `group.id` values are independent subscribers and will each
+process every partition. All replicas of one worker fleet must use the same `group.id`.
+Within that group, only the current assignment generation may publish results or advance
+offsets. For completed offsets `100` and `102` with `101` still running, the highest safe
+commit is `101`; committing `103` is forbidden because it would skip offset `101`.
 
 ### 8.2 Owner affinity and idempotency
 
@@ -359,6 +390,9 @@ aborts, retries, DLQ, rebalances, and idempotent duplicates.
 | Pod exceeds TPS demand | Starts remain within configured rate/burst; lag grows rather than dependency load. |
 | Permanent poison record | DLQ/result/lifecycle and source offset commit atomically. |
 | Rebalance during concurrent work | No offset advances over unfinished earlier work. |
+| Former pod completes after revocation | Its stale Kafka transaction is fenced; redelivery converges through the same external idempotency key. |
+| Two pods use different consumer groups | Validation/deployment policy detects the split fleet before both can process production work. |
+| Offsets 100 and 102 complete while 101 runs | Commit advances only to 101, never 103. |
 | New producer session resubmits | Kafka-backed domain idempotency detects the duplicate. |
 | Two jobs for one owner are fetched together | Per-owner gate allows only one active handler for that `ownerId`. |
 | 20,000 requests arrive over ten minutes | Three baseline pods cap starts near 30/second; excess is visible as lag and later drains. |

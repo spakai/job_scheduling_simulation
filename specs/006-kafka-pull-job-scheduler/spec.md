@@ -415,7 +415,14 @@ Integration tests against real Kafka prove:
 10. permanent/exhausted failure reaches the DLQ before source commit;
 11. DLQ failure leaves the source offset uncommitted and applies backpressure;
 12. out-of-order completion never commits over an unfinished earlier offset; and
-13. rebalance and forced shutdown lose no acknowledged work.
+13. rebalance and forced shutdown lose no acknowledged work;
+14. two pods in one `group.id` never hold a stable assignment for the same partition;
+15. a former pod finishing after revocation cannot commit Kafka outputs or offsets under a
+    stale generation;
+16. redelivery to the new pod uses the same external operation id and converges without a
+    duplicate logical effect; and
+17. accidentally configuring two worker `group.id` values is rejected by deployment
+    validation or detected by an acceptance guard.
 
 A load test demonstrates throughput and lag for the selected partitions, maximum replicas,
 per-pod TPS, realistic latency, and skewed keys. Evidence records configured and measured
@@ -442,6 +449,9 @@ The chaos harness from Spec 005 must add these bounded scenarios:
 | `PULL-POD-01` | Terminate one of three pods during the ten-minute burst profile | Rebalance is bounded, ownership remains exclusive, duplicates converge, and remaining pods obey their own TPS limits. |
 | `PULL-BP-01` | Fail result/lifecycle publication during the burst | Affected partitions pause without source commits, heartbeat polls continue, and backlog drains after recovery. |
 | `PULL-REB-01` | Repeated controlled rebalances with concurrent owners | No owner executes concurrently across generations and no offset advances over incomplete work. |
+| `PULL-REB-02` | Hold an external call in the old pod across revocation, then assign its partition to a new pod | The stale Kafka transaction is fenced, the source offset is not skipped, and redelivery converges through external idempotency. |
+| `PULL-OFF-01` | Complete offsets 100 and 102 while offset 101 remains blocked | The committed next offset is 101, never 103; releasing 101 then permits commit through 103. |
+| `PULL-GRP-01` | Start otherwise identical workers with two different `group.id` values in an isolated test | The test demonstrates duplicate delivery and proves production validation/alerting prevents this topology. |
 
 Each scenario records the generated arrival curve; unique and hot-owner distributions;
 handler p50/p95/p99 duration; per-pod starts per second; partition lag and oldest age;
