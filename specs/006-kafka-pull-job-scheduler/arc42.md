@@ -222,8 +222,8 @@ sequenceDiagram
     W->>W: Acquire TPS token and check inbox
     W->>B: Execute with idempotency key
     B-->>W: Success
-    W->>K: Begin transaction; result + lifecycle + inbox
-    W->>K: Send source offset; commit transaction
+    W->>K: Begin transaction for result, lifecycle, and inbox
+    W->>K: Send source offset and commit transaction
     K-->>W: Transaction committed
 ```
 
@@ -235,7 +235,7 @@ sequenceDiagram
     participant W as Worker
     W->>K: Publish required output transaction
     K--xW: Timeout/failure
-    W->>W: Abort transaction; retain source offset
+    W->>W: Abort transaction and retain source offset
     W->>K: Pause assigned partition(s)
     loop Heartbeat and bounded recovery probes
         W->>K: Poll while paused
