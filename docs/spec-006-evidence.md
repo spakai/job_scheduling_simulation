@@ -45,3 +45,24 @@ not a Spec 006 acceptance requirement and was not tested.
 - Transaction abort and stale-generation fencing at deterministic failpoints.
 - Rebalance with an in-flight external handler.
 - Extended soak and repeated broker/pod recovery runs.
+
+## Bounded performance results
+
+The following local Docker measurements used six partitions, two worker pods, 10 sustained
+starts/second per pod, burst 10, and the built-in `PRINT` handler. They are engineering
+signals, not production benchmarks.
+
+| Scenario | Result |
+| --- | --- |
+| 400 jobs, 200 owners | Produced in 1.113s; drained in 20.205s total (19.80 jobs/s); observed peak lag 294; final lag 0. |
+| Per-pod distribution | Worker 1 processed 206 and worker 2 processed 194; transaction failures 0. |
+| Resulting work-topic offsets | Partition log ends were 63, 64, 81, 52, 77, and 85; these include 22 earlier smoke/test records. |
+| 400 jobs, 50% hot owner | Produced in 1.251s; drained in 28.970s total (13.81 jobs/s); final lag 0. |
+| Hot-owner partition distribution | Partition deltas were 25, 33, 43, 25, 234, and 40, demonstrating the expected single-partition bottleneck. |
+| 400-job burst plus one pod stopped | Stop began at 2.005s and completed in 1.225s; survivor acquired all six partitions and drained to lag 0 in 35.310s total. |
+| Pod-loss lag | Observed peak lag 339; final lag 0; surviving pod owned all six partitions. |
+
+The balanced test closely matched the configured aggregate ceiling of 20 starts/second.
+The hot-owner result confirms that adding owners/partitions improves parallelism only when
+traffic is distributed; one owner remains serialized on its partition. Pod loss reduced
+the fleet ceiling to about 10 starts/second until the second worker restarted.
