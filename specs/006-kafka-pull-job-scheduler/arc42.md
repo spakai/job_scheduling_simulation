@@ -361,6 +361,25 @@ aborts, retries, DLQ, rebalances, and idempotent duplicates.
 | Rebalance during concurrent work | No offset advances over unfinished earlier work. |
 | New producer session resubmits | Kafka-backed domain idempotency detects the duplicate. |
 | Two jobs for one owner are fetched together | Per-owner gate allows only one active handler for that `ownerId`. |
+| 20,000 requests arrive over ten minutes | Three baseline pods cap starts near 30/second; excess is visible as lag and later drains. |
+| One owner produces 50% of a burst | Its jobs remain serialized and skew is measurable without corrupting other partitions. |
+| One of three pods dies during a burst | Kafka reassigns partitions; duplicates converge and surviving pods retain their TPS limits. |
+| 20,000 requests arrive in one minute | Kafka retains intake while bounded pod queues avoid memory growth; recovery duration is measured. |
+
+### 10.1 Capacity and chaos baseline
+
+The initial hypothesis is six work partitions and three pods, each configured for 10
+sustained starts/second, burst 10, concurrency 20, and one active handler per `ownerId`.
+The expected aggregate start ceiling is approximately 30/second, subject to owner skew,
+handler duration, and partition assignment. Daily volume of 20,000 requests is only 0.23
+requests/second on average and is not itself a sufficient sizing input.
+
+Capacity evidence exercises 24-hour-equivalent, one-hour, ten-minute, and one-minute
+arrival curves. Chaos is overlaid with a 50% hot owner, single-pod termination, output-topic
+failure/backpressure, and repeated rebalances. Each experiment proves owner non-overlap,
+offset safety, bounded memory/queues, per-pod TPS, observable lag, and bounded backlog drain.
+Six partitions remain a proposal until these tests meet the agreed objectives; twelve must
+be evaluated if six cannot absorb realistic peak and recovery demand.
 
 ## 11. Risks and Technical Debt
 

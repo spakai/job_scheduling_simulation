@@ -278,18 +278,28 @@ Tasks:
 4. Add trace propagation using job, attempt, topic, partition, offset, and worker identity.
 5. Add alerts for no consumers, sustained lag, all pods paused, rebalances, transaction
    aborts, DLQ growth, state restore delay, and partition skew.
-6. Load-test partitions, maximum replicas, skewed keys, realistic handler latency, TPS, and
-   autoscaling changes.
-7. Run broker outage, network ambiguity, pod kill, rebalance storm, and output-topic outage
-   scenarios.
-8. Write `docs/spec-006-runbook.md` and evidence index, including pause/resume, DLQ inspect,
+6. Implement an accelerated deterministic 20,000-request generator with configurable
+   arrival window, owner distribution, handler duration, and seed.
+7. Establish the initial capacity hypothesis: six partitions, three pods, 10 sustained
+   starts/second and burst 10 per pod, concurrency 20 per pod, and one active job per owner.
+8. Run `PULL-CAP-01` through `PULL-CAP-04` for 24-hour-equivalent, one-hour, ten-minute,
+   and one-minute arrival curves.
+9. Run `PULL-SKEW-01` with one owner carrying 50% of requests and assert zero owner overlap.
+10. Run `PULL-POD-01`, `PULL-BP-01`, and `PULL-REB-01` during the ten-minute burst profile.
+11. Compare six and twelve partitions when six misses the declared latency or recovery
+    objective; retain the chosen count and evidence as a release decision.
+12. Run broker outage, network ambiguity, pod kill, rebalance storm, and output-topic outage
+    scenarios.
+13. Write `docs/spec-006-runbook.md` and evidence index, including pause/resume, DLQ inspect,
    authorized replay, and transaction diagnosis.
 
 Exit criteria:
 
 - Operators can distinguish throttling, capacity saturation, key skew, dependency failure,
   state restore, and broker failure.
-- Load evidence demonstrates the selected partition/replica/TPS envelope.
+- Load evidence demonstrates the selected partition/replica/TPS envelope for 20,000 daily
+  requests and all required compressed burst profiles.
+- Every capacity/chaos scenario proves zero same-owner overlap and bounded local queues.
 - Every recovery scenario is bounded and retains sanitized evidence.
 
 ### Phase 7 — Migration and retirement
@@ -327,6 +337,7 @@ Exit criteria:
 | Owner serialization | Keyed gate | Same owner never overlaps | Hot-owner load and rebalance |
 | TPS | Virtual-clock token bucket | Per-pod measured rate | Replica scale and bursts |
 | Backpressure | Transition model | Pause with heartbeat polls | Output-topic outage/recovery |
+| Capacity | Deterministic arrival generator | 20,000-request compressed profiles | Six-versus-twelve partition evidence |
 | Retry/DLQ | Classification/envelope | Transactional handoff | Poison, exhaustion, DLQ outage |
 | Migration | Manifest/reconciliation | Legacy snapshot to Kafka | Cutover and rollback rehearsal |
 
@@ -336,14 +347,15 @@ CI tiers are:
 
 1. **Pull request:** unit tests, schema compatibility, static config/ACL validation, and a
    bounded single-broker transaction suite.
-2. **Nightly:** multi-broker Kafka, multi-pod ownership, rebalance, state restore, output
-   outage, pod-kill, and TPS/load scenarios.
+2. **Nightly:** `PULL-CAP-01` through `PULL-CAP-04`, `PULL-SKEW-01`, `PULL-POD-01`,
+   `PULL-BP-01`, `PULL-REB-01`, multi-broker Kafka, state restore, and TPS scenarios.
 3. **Release:** nightly suite plus repeated migration/rollback rehearsal and representative
    capacity evidence.
 
 Evidence includes effective topic configuration, schema versions, consumer assignments,
 committed offsets, transaction state, result/DLQ coordinates, per-pod TPS measurements,
-pause transitions, lag/age, state restore time, process restarts, and recovery duration.
+pause transitions, lag/age, owner distribution and overlap count, queue high-water marks,
+state restore time, process restarts, and backlog recovery duration.
 Credentials and governed payload fields are redacted.
 
 ## 9. Migration and Rollback

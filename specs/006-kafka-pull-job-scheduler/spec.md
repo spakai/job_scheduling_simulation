@@ -421,6 +421,40 @@ A load test demonstrates throughput and lag for the selected partitions, maximum
 per-pod TPS, realistic latency, and skewed keys. Evidence records configured and measured
 TPS for each pod, not only aggregate throughput.
 
+### 14.1 Capacity baseline and chaos profiles
+
+The initial planning volume is 20,000 requests per day. This is approximately 0.23 requests
+per second when evenly distributed, but partition sizing must use peak arrival rate,
+handler duration, active-owner count, and owner skew rather than the daily average alone.
+The initial test topology is six work partitions, three worker pods, 10 sustained starts
+per second per pod, burst 10, bounded concurrency 20 per pod, and one active job per
+`ownerId`. These are test assumptions to validate, not production guarantees.
+
+The chaos harness from Spec 005 must add these bounded scenarios:
+
+| ID | Workload/fault | Required proof |
+| --- | --- | --- |
+| `PULL-CAP-01` | 20,000 requests distributed across 24 hours, accelerated deterministically | No owner overlaps; measured TPS, lag, and partition balance match the baseline. |
+| `PULL-CAP-02` | 20,000 requests compressed into one hour (about 5.6 requests/second) | Three pods remain within their individual TPS limits and backlog stays within the declared objective. |
+| `PULL-CAP-03` | 20,000 requests compressed into ten minutes (about 33.4 requests/second) | Rate limiting caps starts near 30/second, excess becomes observable lag, and the backlog drains after the burst. |
+| `PULL-CAP-04` | 20,000 requests compressed into one minute (about 333.4 requests/second) | Intake remains durable, memory/queues stay bounded, no offsets are skipped, and recovery time is measured. |
+| `PULL-SKEW-01` | One hot `ownerId` receives 50% of requests | That owner never overlaps; its partition skew and head-of-line effects are observable without corrupting other partitions. |
+| `PULL-POD-01` | Terminate one of three pods during the ten-minute burst profile | Rebalance is bounded, ownership remains exclusive, duplicates converge, and remaining pods obey their own TPS limits. |
+| `PULL-BP-01` | Fail result/lifecycle publication during the burst | Affected partitions pause without source commits, heartbeat polls continue, and backlog drains after recovery. |
+| `PULL-REB-01` | Repeated controlled rebalances with concurrent owners | No owner executes concurrently across generations and no offset advances over incomplete work. |
+
+Each scenario records the generated arrival curve; unique and hot-owner distributions;
+handler p50/p95/p99 duration; per-pod starts per second; partition lag and oldest age;
+queue/concurrency high-water marks; owner-overlap violations; rebalance/pause history; and
+time to drain below the recovery threshold. Fault duration, request count, affected pods,
+abort conditions, and cleanup follow Spec 005 safety requirements.
+
+Six partitions are accepted only if these tests meet the declared latency and recovery
+objectives. Twelve partitions should be evaluated before production when peak bursts,
+handler duration, or active-owner distribution cannot be served by six. Changing partition
+count after cutover remains a controlled ordering migration because existing `ownerId`
+values may map differently.
+
 ## 15. Migration
 
 Cutover must:
