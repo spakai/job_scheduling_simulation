@@ -1,11 +1,19 @@
 # Scheduled Job Scheduling and Visibility Architecture
 
-Status: current implementation through Spec 004
-Last updated: 2026-08-21
+Status: current implementation through Spec 006; target pull-worker architecture in Spec 007
+Last updated: 2026-09-06
 
 This document uses the arc42 structure for architectural concerns and C4-style views for
 system context, containers, components, and deployment. It covers the deterministic
 simulation and the durable production-like runtime delivered by Specs 002–004.
+
+The database-free Kafka pull path delivered by Spec 006 is the current pull-worker
+baseline. Its target production replacement is the Java 21/Vert.x 5 architecture in
+[`specs/007-vertx-kafka-pull-worker/arc42.md`](specs/007-vertx-kafka-pull-worker/arc42.md).
+That architecture is authoritative for pull-worker threading, serial partition lanes,
+cross-partition concurrency, exact manual offsets, Kafka transactions, backpressure, and
+completed-request deduplication. This document remains authoritative for the simulator and
+visibility system until those components receive a separate migration specification.
 
 ## 1. Introduction and goals
 

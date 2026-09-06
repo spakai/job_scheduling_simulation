@@ -1,10 +1,12 @@
 # Kafka Pull-Based Job Scheduler Architecture
 
-Status: proposed for review
+Status: implemented baseline; worker runtime superseded by Spec 007
 
 Last updated: 2026-09-06
 
 Governing specification: [`spec.md`](spec.md)
+
+Runtime successor: [`../007-vertx-kafka-pull-worker/arc42.md`](../007-vertx-kafka-pull-worker/arc42.md)
 
 This document follows arc42 and uses C4-style diagrams. It describes the target Kafka-only
 execution architecture for Spec 006.

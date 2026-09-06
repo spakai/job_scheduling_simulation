@@ -1,10 +1,12 @@
 # Kafka Pull-Based Job Scheduler Implementation Plan
 
-Status: proposed
+Status: baseline implemented; Vert.x migration continues in Spec 007
 
 Implements: [`spec.md`](spec.md)
 
 Architecture: [`arc42.md`](arc42.md)
+
+Successor plan: [`../007-vertx-kafka-pull-worker/plan.md`](../007-vertx-kafka-pull-worker/plan.md)
 
 Depends on: merged Specs 002–004
 

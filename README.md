@@ -38,6 +38,9 @@ Resource-pressure experiments and deterministic application fault injection are 
 [`specs/005-resource-pressure-fault-injection`](specs/005-resource-pressure-fault-injection/).
 The proposed Kafka pull-based scheduler replacement is specified in
 [`specs/006-kafka-pull-job-scheduler`](specs/006-kafka-pull-job-scheduler/).
+The target Java 21/Vert.x 5 worker architecture, partition-lane concurrency, exact manual
+offset model, and completed-request deduplication are specified in
+[`specs/007-vertx-kafka-pull-worker`](specs/007-vertx-kafka-pull-worker/).
 The arc42-aligned C4 architecture documentation is in [`architecture.md`](architecture.md).
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).

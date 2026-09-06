@@ -1,6 +1,8 @@
 # Kafka Pull-Based Job Scheduler Specification
 
-Status: proposed
+Status: implemented baseline; worker runtime superseded by Spec 007
+
+Runtime successor: [`../007-vertx-kafka-pull-worker/spec.md`](../007-vertx-kafka-pull-worker/spec.md)
 
 Supersedes: the database-polling execution model in Specs 002 and 004
 
