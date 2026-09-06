@@ -183,17 +183,18 @@ flowchart LR
 flowchart LR
     consumer["Kafka consumer loop"]
     capacity["Capacity gate"]
+    lanes["Serial partition lanes"]
     limiter["Token-bucket limiter"]
     ownerGate["Per-owner execution gate"]
     registry["Handler registry"]
     handler["Job handler"]
     outcome["Outcome classifier"]
     publisher["Transactional publisher"]
-    offsets["Contiguous offset tracker"]
+    offsets["Per-partition offset coordinator"]
     pressure["Backpressure controller"]
     health["Health and telemetry"]
 
-    consumer --> capacity --> limiter --> ownerGate --> registry --> handler --> outcome
+    consumer --> capacity --> lanes --> limiter --> ownerGate --> registry --> handler --> outcome
     outcome --> publisher --> offsets
     publisher -->|"Failure/success signal"| pressure
     pressure -->|"Pause/resume assignments"| consumer
@@ -279,6 +280,35 @@ sequenceDiagram
     B->>K: Commit outputs and source offset transactionally
 ```
 
+### 6.5 Concurrent partitions and manual commits
+
+The consumer poll loop routes each record to the serial lane for its source partition.
+Different partition lanes may execute simultaneously, while each lane handles only its
+current lowest offset. A pod owning partitions 0, 2, and 5 can therefore run three handlers
+at once without creating an offset gap inside any partition.
+
+```mermaid
+flowchart LR
+    poll["Consumer poll and heartbeat loop"]
+    p0["Partition 0 lane: 10 then 11 then 12"]
+    p2["Partition 2 lane: 40 then 41 then 42"]
+    p5["Partition 5 lane: 70 then 71 then 72"]
+    tx["Serialized Kafka transaction coordinator"]
+    offsets["Committed next offsets by partition"]
+
+    poll --> p0
+    poll --> p2
+    poll --> p5
+    p0 --> tx
+    p2 --> tx
+    p5 --> tx
+    tx --> offsets
+```
+
+Kafka stores one next offset per `(group.id, topic, partition)`, not one acknowledgement per
+record. A transaction may send a map such as partition 0 at 14, partition 2 at 87, and
+partition 5 at 32. Each value acknowledges every earlier offset in that partition.
+
 ## 7. Deployment View
 
 ```mermaid
@@ -319,6 +349,29 @@ Within that group, only the current assignment generation may publish results or
 offsets. For completed offsets `100` and `102` with `101` still running, the highest safe
 commit is `101`; committing `103` is forbidden because it would skip offset `101`.
 
+The selected Spec 006 model is serial execution within a partition and concurrency across
+assigned partitions. Each partition lane performs:
+
+1. take its lowest queued offset;
+2. acquire pod TPS capacity and the owner gate;
+3. execute the handler;
+4. submit its outcome to the pod's serialized Kafka transaction coordinator;
+5. publish result/lifecycle/retry/DLQ records and the partition's next offset in one
+   transaction; and
+6. release the lane only after commit or rewind/pause on failure.
+
+The consumer poll/heartbeat loop is separate from these lanes. Bounded per-partition queues
+apply pause/resume without blocking group heartbeats. One Confluent transactional producer
+must not run overlapping transactions, so the pod serializes transaction commits even when
+handlers on different partitions execute concurrently.
+
+Same-partition concurrency is a possible future optimization, not the selected design. It
+would require holding completed results behind a contiguous watermark. If offsets 11 and 13
+finish while 10 and 12 run, no offset can advance; after 10 finishes the next safe offset
+is 12, and only after 12 finishes is 14 safe. Buffering those results adds memory,
+head-of-line, rebalance, and duplicate-output complexity without improving hot-owner
+throughput.
+
 ### 8.2 Owner affinity and duplicate semantics
 
 `ownerId` is a canonical subscriber or business-group identifier and is the serialized
@@ -333,9 +386,9 @@ those scopes cannot guarantee subscriber affinity. Canonical keys include a name
 as `subscriber:123` or `group:123`. The Kafka consumer `group.id` names a worker fleet and
 has no relationship to a business group owner.
 
-Partition affinity does not itself prevent concurrent dispatch inside a worker. A per-owner
-gate permits at most one active job for each `ownerId`; different owners sharing a partition
-may execute concurrently behind contiguous offset tracking. There is no durable
+Partition affinity does not itself prevent concurrent dispatch inside a worker. The serial
+partition lane inherently prevents overlap for owners in that partition, and the per-owner
+gate remains a defensive invariant across assignment transitions. There is no durable
 `(jobId, attempt)` lookup in Spec 006. Redelivery or resubmission may repeat execution and
 produce duplicate results; durable deduplication and conflict handling are deferred.
 
@@ -370,6 +423,8 @@ aborts, retries, DLQ, rebalances, and repeated job/attempt observations.
 | ADR-006-07 | Kafka transactions couple outputs and source offsets. | Avoids partial Kafka handoffs. | Unique transactional IDs and `read_committed` are required. |
 | ADR-006-08 | End-to-end semantics remain at least once. | External side effects cannot join Kafka transactions. | Duplicate execution is accepted and must be observable. |
 | ADR-006-09 | Durable job deduplication is deferred. | Keep Spec 006 focused on pull delivery, flow control, and offset safety. | A later spec must define storage, TTL/retention, conflicts, and external idempotency. |
+| ADR-006-10 | Process one record at a time per partition and different partitions concurrently. | Manual commits remain gap-free while a pod still uses all assigned partitions. | Unrelated owners sharing a partition are serialized. |
+| ADR-006-11 | Serialize Kafka transactions per pod. | A producer cannot safely run overlapping transactions. | Handler concurrency may exceed transaction-commit concurrency. |
 
 ## 10. Quality Requirements
 
@@ -384,6 +439,9 @@ aborts, retries, DLQ, rebalances, and repeated job/attempt observations.
 | Former pod completes after revocation | Its stale Kafka transaction is fenced; redelivery may repeat the external effect. |
 | Two pods use different consumer groups | Validation/deployment policy detects the split fleet before both can process production work. |
 | Offsets 100 and 102 complete while 101 runs | Commit advances only to 101, never 103. |
+| One pod owns three partitions | Up to three partition lanes execute concurrently while offsets advance independently. |
+| Two records share one partition | The second handler starts only after the first record's Kafka transaction commits. |
+| Two partition lanes finish together | One transaction coordinator serializes their commits without mixing ownership generations. |
 | New producer session resubmits | Both records may execute; metrics expose the repeated `(jobId, attempt)`. |
 | Two jobs for one owner are fetched together | Per-owner gate allows only one active handler for that `ownerId`. |
 | 20,000 requests arrive over ten minutes | Three baseline pods cap starts near 30/second; excess is visible as lag and later drains. |
