@@ -27,6 +27,12 @@ class PullSchedulerConfig(BaseModel):
     max_concurrency: int = Field(default=20, ge=1)
     poll_timeout_seconds: float = Field(default=1, gt=0, le=30)
     transaction_timeout_ms: int = Field(default=30_000, ge=1)
+    max_poll_interval_ms: int = Field(default=300_000, ge=1)
+    backpressure_failure_threshold: int = Field(default=1, ge=1)
+    backpressure_recovery_threshold: int = Field(default=2, ge=1)
+    backpressure_initial_seconds: float = Field(default=1, gt=0)
+    backpressure_max_seconds: float = Field(default=30, gt=0)
+    health_port: int = Field(default=8080, ge=1, le=65_535)
 
     @model_validator(mode="after")
     def validate_rate(self) -> Self:
@@ -34,6 +40,8 @@ class PullSchedulerConfig(BaseModel):
             raise ValueError("rateLimitBurst must be 1 when TPS is zero")
         if len({self.work_topic, self.result_topic, self.lifecycle_topic, self.dlq_topic}) != 4:
             raise ValueError("pull scheduler topics must be distinct")
+        if self.backpressure_initial_seconds > self.backpressure_max_seconds:
+            raise ValueError("backpressure initial delay cannot exceed maximum")
         return self
 
 
@@ -58,6 +66,18 @@ def pull_scheduler_config_from_env(
             max_concurrency=int(values.get("PULL_WORKER_MAX_CONCURRENCY", "20")),
             poll_timeout_seconds=float(values.get("PULL_WORKER_POLL_SECONDS", "1")),
             transaction_timeout_ms=int(values.get("KAFKA_TRANSACTION_TIMEOUT_MS", "30000")),
+            max_poll_interval_ms=int(values.get("KAFKA_MAX_POLL_INTERVAL_MS", "300000")),
+            backpressure_failure_threshold=int(
+                values.get("PULL_BACKPRESSURE_FAILURE_THRESHOLD", "1")
+            ),
+            backpressure_recovery_threshold=int(
+                values.get("PULL_BACKPRESSURE_RECOVERY_THRESHOLD", "2")
+            ),
+            backpressure_initial_seconds=float(
+                values.get("PULL_BACKPRESSURE_INITIAL_SECONDS", "1")
+            ),
+            backpressure_max_seconds=float(values.get("PULL_BACKPRESSURE_MAX_SECONDS", "30")),
+            health_port=int(values.get("PULL_WORKER_HEALTH_PORT", "8080")),
         )
     except ValueError as exc:
         raise ConfigurationError("invalid pull scheduler configuration") from exc

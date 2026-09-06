@@ -243,6 +243,11 @@ services:
       KAFKA_WORKER_GROUP: job-workers-v1
       PULL_WORKER_TPS: 10
       PULL_WORKER_BURST: 10
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   pull-worker-2:
     profiles: ["pull"]
@@ -259,6 +264,11 @@ services:
       KAFKA_WORKER_GROUP: job-workers-v1
       PULL_WORKER_TPS: 10
       PULL_WORKER_BURST: 10
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   outbox-publisher:
     profiles: ["apps"]

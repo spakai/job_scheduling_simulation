@@ -7,6 +7,8 @@ from pydantic import ValidationError
 
 from job_visibility.config import ConfigurationError
 from job_visibility.pull_scheduler import (
+    BackpressureController,
+    BackpressureState,
     ContiguousOffsetTracker,
     OwnerGate,
     PullJobRequest,
@@ -73,6 +75,24 @@ def test_token_bucket_enforces_burst_and_refill() -> None:
     now[0] = 0.5
     assert bucket.try_acquire() is True
     assert bucket.try_acquire() is False
+
+
+def test_backpressure_requires_cooldown_and_recovery_threshold() -> None:
+    now = [0.0]
+    controller = BackpressureController(
+        recovery_threshold=2,
+        initial_backoff_seconds=1,
+        max_backoff_seconds=4,
+        clock=lambda: now[0],
+    )
+
+    assert controller.failure() is BackpressureState.PAUSED
+    assert controller.should_probe() is False
+    now[0] = 1
+    assert controller.should_probe() is True
+    assert controller.success() is BackpressureState.PROBING
+    assert controller.should_probe() is True
+    assert controller.success() is BackpressureState.RUNNING
 
 
 def test_pull_config_is_database_free_and_validates_topics() -> None:

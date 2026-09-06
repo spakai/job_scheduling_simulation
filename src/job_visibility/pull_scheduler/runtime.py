@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from prometheus_client import Counter, Gauge
 from pydantic import ValidationError
 
 from job_visibility.model import Event, EventType
@@ -16,9 +17,17 @@ from job_visibility.scheduler.handlers import HandlerError, fibonacci
 
 from .config import PullSchedulerConfig
 from .contracts import JobResult, PullJobRequest
-from .primitives import OwnerGate, TokenBucket
+from .health import HealthServer
+from .primitives import BackpressureController, BackpressureState, OwnerGate, TokenBucket
 
 LOGGER = logging.getLogger(__name__)
+PROCESSED = Counter("pull_scheduler_processed_total", "Pull jobs processed", ["outcome"])
+TRANSACTION_FAILURES = Counter(
+    "pull_scheduler_transaction_failures_total", "Pull-worker Kafka transaction failures"
+)
+REBALANCES = Counter("pull_scheduler_rebalances_total", "Pull-worker rebalances", ["action"])
+BACKPRESSURE = Gauge("pull_scheduler_backpressure", "Backpressure active (1 or 0)")
+ASSIGNED = Gauge("pull_scheduler_assigned_partitions", "Assigned pull-work partitions")
 
 
 class PullJobProcessor:
@@ -68,8 +77,15 @@ class ConfluentPullWorker:
         self.processor = processor or PullJobProcessor()
         self.rate_limiter = TokenBucket(config.rate_limit_tps, config.rate_limit_burst)
         self.owner_gate = OwnerGate()
+        self.backpressure = BackpressureController(
+            failure_threshold=config.backpressure_failure_threshold,
+            recovery_threshold=config.backpressure_recovery_threshold,
+            initial_backoff_seconds=config.backpressure_initial_seconds,
+            max_backoff_seconds=config.backpressure_max_seconds,
+        )
         self.stopping = False
         self.paused = False
+        self.assigned_partitions = 0
         self.consumer = Consumer(
             {
                 "bootstrap.servers": config.bootstrap_servers,
@@ -79,6 +95,7 @@ class ConfluentPullWorker:
                 "enable.auto.offset.store": False,
                 "isolation.level": "read_committed",
                 "auto.offset.reset": "earliest",
+                "max.poll.interval.ms": config.max_poll_interval_ms,
             }
         )
         self.producer = Producer(
@@ -101,7 +118,26 @@ class ConfluentPullWorker:
             conf={"auto.register.schemas": False, "use.latest.version": True},
         )
         self.producer.init_transactions(config.transaction_timeout_ms / 1_000)
-        self.consumer.subscribe([config.work_topic])
+        self.consumer.subscribe(
+            [config.work_topic], on_assign=self._on_assign, on_revoke=self._on_revoke
+        )
+
+    @property
+    def ready(self) -> bool:
+        return (
+            not self.stopping
+            and self.assigned_partitions > 0
+            and self.backpressure.state is BackpressureState.RUNNING
+        )
+
+    @property
+    def health_details(self) -> dict[str, object]:
+        return {
+            "instanceId": self.config.instance_id,
+            "consumerGroup": self.config.consumer_group,
+            "backpressure": self.backpressure.state.value,
+            "assignedPartitions": self.assigned_partitions,
+        }
 
     def stop(self) -> None:
         self.stopping = True
@@ -116,15 +152,23 @@ class ConfluentPullWorker:
     def run_once(self) -> bool:
         if self.paused:
             self.consumer.poll(0)
-            try:
-                self.producer.list_topics(timeout=self.config.poll_timeout_seconds)
-            except Exception:
-                time.sleep(min(1.0, self.config.poll_timeout_seconds))
-                return False
+            if self.backpressure.state is not BackpressureState.RUNNING:
+                if not self.backpressure.should_probe():
+                    time.sleep(min(0.25, self.config.poll_timeout_seconds))
+                    return False
+                try:
+                    self.producer.list_topics(timeout=self.config.poll_timeout_seconds)
+                except Exception:
+                    self.backpressure.failure()
+                    time.sleep(min(1.0, self.config.poll_timeout_seconds))
+                    return False
+                if self.backpressure.success() is not BackpressureState.RUNNING:
+                    return False
             assignments = self.consumer.assignment()
             if assignments:
                 self.consumer.resume(assignments)
             self.paused = False
+            BACKPRESSURE.set(0)
 
         message = self.consumer.poll(self.config.poll_timeout_seconds)
         if message is None:
@@ -132,7 +176,7 @@ class ConfluentPullWorker:
         if message.error():
             raise RuntimeError(str(message.error()))
         if not self.rate_limiter.try_acquire():
-            self._pause_and_rewind(message)
+            self._pause_and_rewind(message, failure=False)
             return False
 
         key = message.key().decode("utf-8") if message.key() else ""
@@ -150,8 +194,10 @@ class ConfluentPullWorker:
             try:
                 summary = self.processor.execute(job)
                 self._commit_success(message, job, summary)
+                PROCESSED.labels("success").inc()
             except HandlerError as exc:
                 self._commit_handler_failure(message, job, exc)
+                PROCESSED.labels("retry" if exc.retryable else "dlq").inc()
         finally:
             self.owner_gate.release(job.owner_id)
         return True
@@ -251,13 +297,14 @@ class ConfluentPullWorker:
             )
             self.producer.commit_transaction(self.config.transaction_timeout_ms / 1_000)
         except Exception:
+            TRANSACTION_FAILURES.inc()
             try:
                 self.producer.abort_transaction(self.config.transaction_timeout_ms / 1_000)
             finally:
                 self._pause_and_rewind(message)
             raise
 
-    def _pause_and_rewind(self, message: Any) -> None:
+    def _pause_and_rewind(self, message: Any, *, failure: bool = True) -> None:
         from confluent_kafka import TopicPartition
 
         self.consumer.seek(TopicPartition(message.topic(), message.partition(), message.offset()))
@@ -265,6 +312,21 @@ class ConfluentPullWorker:
         if assignments:
             self.consumer.pause(assignments)
         self.paused = True
+        if failure:
+            self.backpressure.failure()
+            BACKPRESSURE.set(1)
+
+    def _on_assign(self, consumer: Any, partitions: list[Any]) -> None:
+        self.assigned_partitions = len(partitions)
+        ASSIGNED.set(len(partitions))
+        REBALANCES.labels("assign").inc()
+        consumer.assign(partitions)
+
+    def _on_revoke(self, consumer: Any, partitions: list[Any]) -> None:
+        self.assigned_partitions = 0
+        ASSIGNED.set(0)
+        REBALANCES.labels("revoke").inc()
+        consumer.unassign()
 
     @staticmethod
     def _json(value: dict[str, Any]) -> bytes:
@@ -312,6 +374,8 @@ class ConfluentPullWorker:
 
 def run_pull_worker(config: PullSchedulerConfig) -> None:
     worker = ConfluentPullWorker(config)
+    health = HealthServer(worker, config.health_port)
+    health.start()
 
     def stop(_signum: int, _frame: object) -> None:
         worker.stop()
@@ -321,4 +385,5 @@ def run_pull_worker(config: PullSchedulerConfig) -> None:
     try:
         worker.run_forever()
     finally:
+        health.close()
         worker.close()
