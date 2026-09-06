@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job-requests-v1",
+  "title": "JobRequestV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "jobId", "ownerId", "ownerType", "correlationId", "jobType", "requestedAt", "attempt", "maxAttempts"],
+  "properties": {
+    "schemaVersion": {"type": "integer", "const": 1},
+    "jobId": {"type": "string", "minLength": 1},
+    "ownerId": {"type": "string", "pattern": "^(subscriber|group):.+$"},
+    "ownerType": {"type": "string", "enum": ["SUBSCRIBER", "GROUP"]},
+    "correlationId": {"type": "string", "minLength": 1},
+    "jobType": {"type": "string", "minLength": 1},
+    "requestedAt": {"type": "string", "format": "date-time"},
+    "attempt": {"type": "integer", "minimum": 1},
+    "maxAttempts": {"type": "integer", "minimum": 1},
+    "payload": {"type": "object"},
+    "payloadReference": {"type": "string", "minLength": 1}
+  }
+}

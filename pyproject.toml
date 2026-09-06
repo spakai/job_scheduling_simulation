@@ -31,6 +31,7 @@ job-visibility-sim = "job_visibility.cli:main"
 job-visibility-runtime = "job_visibility.runtime:main"
 job-visibility-api = "job_visibility.production_api:main"
 job-visibility-chaos = "job_visibility.chaos.cli:main"
+job-visibility-pull = "job_visibility.pull_scheduler.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

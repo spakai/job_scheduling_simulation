@@ -228,6 +228,38 @@ services:
       SCHEDULER_DATABASE_URL: postgresql+psycopg://scheduler_owner:scheduler-local@scheduler-postgres:5432/scheduler
       SCHEDULER_WORKER_OWNER: compose-worker
 
+  pull-worker-1:
+    profiles: ["pull"]
+    build: .
+    command: ["job-visibility-pull", "worker"]
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      PULL_WORKER_INSTANCE_ID: pull-worker-1
+      KAFKA_TRANSACTIONAL_ID: pull-worker-1
+      KAFKA_WORKER_GROUP: job-workers-v1
+      PULL_WORKER_TPS: 10
+      PULL_WORKER_BURST: 10
+
+  pull-worker-2:
+    profiles: ["pull"]
+    build: .
+    command: ["job-visibility-pull", "worker"]
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      PULL_WORKER_INSTANCE_ID: pull-worker-2
+      KAFKA_TRANSACTIONAL_ID: pull-worker-2
+      KAFKA_WORKER_GROUP: job-workers-v1
+      PULL_WORKER_TPS: 10
+      PULL_WORKER_BURST: 10
+
   outbox-publisher:
     profiles: ["apps"]
     build: .

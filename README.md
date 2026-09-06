@@ -42,6 +42,30 @@ The arc42-aligned C4 architecture documentation is in [`architecture.md`](archit
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).
 
+## Spec 006 Kafka pull workers
+
+Start Kafka, Schema Registry, topic setup, and two database-free pull-worker containers:
+
+```bash
+docker compose --profile pull up --build kafka schema-registry kafka-setup \
+  pull-worker-1 pull-worker-2
+```
+
+Publish an immediately eligible test request through the same application image:
+
+```bash
+docker compose --profile pull run --rm pull-worker-1 job-visibility-pull produce \
+  --job-id job-1 \
+  --owner-id subscriber:123 \
+  --owner-type SUBSCRIBER \
+  --correlation-id demo-1 \
+  --payload '{"message":"hello"}'
+```
+
+Both workers use Kafka consumer group `job-workers-v1`; each has a distinct instance and
+transactional producer ID. The local work topic has six partitions. The pull-worker
+containers do not receive scheduler database credentials.
+
 ## Spec 002 local infrastructure
 
 The durable stack uses physically separate scheduler and EDR PostgreSQL containers, Kafka in
