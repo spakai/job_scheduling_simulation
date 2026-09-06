@@ -106,11 +106,22 @@ The work topic is `job-requests.v1` by default. It must have:
 - `cleanup.policy=delete`, unless compaction is separately reviewed; and
 - a registered schema with a rolling-upgrade-compatible policy.
 
-The producer must set an explicit record key. The default key is `jobId`, keeping
-redeliveries and commands for one job in the same partition. Workloads needing ordering
-across jobs may use a stable `orderingKey` such as account or tenant ID, but must document
-the resulting hot-partition and head-of-line blocking risk. Null or randomly changing keys
-are prohibited.
+The producer must set `ownerId` as the Kafka record key. `ownerId` is the stable
+serialization owner for the job and may identify either one subscriber or one business
+group. All jobs for the same owner therefore hash to the same partition. `ownerType`
+(`SUBSCRIBER` or `GROUP`) records which ownership scope was selected; `ownerId` values must
+be canonical and globally unambiguous across those namespaces.
+
+The ownership rule must be deterministic for a workload. If subscriber jobs must never
+overlap, every such job uses that subscriber's canonical `ownerId`. If the business group
+is the serialization boundary, every member job uses the group's canonical `ownerId`.
+Producers must not alternate between subscriber and group ownership for the same ordering
+requirement, because those keys may map to different partitions. Recommended canonical
+values include their namespace, for example `subscriber:123` or `group:123`.
+
+Null, randomly changing, or `jobId` keys are prohibited. Every producer must use the same
+key normalization and serializer. Clients must not select a partition explicitly. Retries
+and DLQ replays must preserve the original serialized `ownerId` key.
 
 Partition count is a capacity contract. Increasing it changes the partition selected for
 some newly published keys and can weaken ordering across the change. Any increase requires
@@ -134,6 +145,8 @@ Each work record contains at least:
 | --- | --- |
 | `schemaVersion` | Required work-envelope version. |
 | `jobId` | Stable globally unique job and idempotency key. |
+| `ownerId` | Required stable subscriber or business-group identifier; also the Kafka record key. |
+| `ownerType` | `SUBSCRIBER` or `GROUP`; declares the serialization scope represented by `ownerId`. |
 | `correlationId` | Trace/business correlation identifier. |
 | `jobType` | Allowlisted handler identifier. |
 | `payload` or `payloadReference` | Versioned, size-bounded input or durable reference. |
@@ -152,7 +165,7 @@ failures and follow the DLQ path.
 
 The requesting client is a Kafka producer. It must enable idempotent production, require
 broker acknowledgement from the configured in-sync replicas, use the registered schema,
-and always provide the stable `jobId` key. A successful broker acknowledgement is the
+and always provide the stable `ownerId` key. A successful broker acknowledgement is the
 submission acknowledgement. A timeout is ambiguous: the client retries with the same
 `jobId` and identical immutable request fields.
 
@@ -195,6 +208,12 @@ An offset must not be acknowledged when work has merely been fetched, queued, th
 or started. Concurrent processing within one partition requires an offset tracker that
 advances only across the highest contiguous completed sequence. A simpler implementation
 may process one record at a time per partition.
+
+Partition affinity alone does not prevent concurrent execution when a pod dispatches
+multiple records from one partition. The worker must allow at most one active job for each
+`ownerId`. It may enforce this by processing one record at a time per partition or by using
+a bounded keyed execution queue/lock. Jobs for different owners in the same partition may
+run concurrently only when contiguous offset tracking remains correct.
 
 Fetch size, local queue capacity, handler concurrency, and handler deadlines are bounded.
 The local queue must not exceed the work a pod can safely finish within its shutdown and
@@ -320,7 +339,8 @@ fit inside the platform termination grace period. `max.poll.interval.ms`, sessio
 batch size, maximum handler time, and shutdown deadline form one reviewed timing budget.
 
 End-to-end delivery is at least once. Before a non-repeatable side effect, a handler uses
-`jobId` plus `attempt`, or a stable operation ID, as an idempotency key. Where the target
+`jobId` plus `attempt`, or a stable operation ID, as an idempotency key. `ownerId` controls
+serialization and is not a replacement for the job idempotency key. Where the target
 does not support idempotency keys, the handler uses a durable inbox, conditional update, or
 compare-and-set boundary. An in-memory completed set is insufficient.
 
@@ -350,6 +370,9 @@ The runtime validates at least:
 Invalid configuration fails startup before the consumer joins the group. Topic
 auto-creation is disabled outside disposable local environments.
 
+Kafka consumer `group.id` identifies the worker fleet and is unrelated to the business
+group represented by an `ownerId` whose `ownerType` is `GROUP`.
+
 ## 13. Observability and Operations
 
 Each pod emits structured logs and metrics for:
@@ -373,23 +396,26 @@ and creates a new work record; original Kafka records are not edited.
 
 ## 14. Testing Strategy
 
-Unit tests cover key selection, validation, failure classification, token-bucket behaviour
-with a virtual clock, pause/resume transitions, and contiguous offset tracking.
+Unit tests cover `ownerId` normalization/key selection, ownership validation, failure
+classification, token-bucket behaviour with a virtual clock, pause/resume transitions, and
+contiguous offset tracking.
 
 Integration tests against real Kafka prove:
 
 1. equal keys remain ordered in one partition;
-2. one group shares partitions across pods without simultaneous ownership;
-3. each pod respects sustained TPS and burst capacity;
-4. required-update failure pauses new work while heartbeats retain membership;
-5. recovery resumes consumption and drains lag;
-6. a crash before the durable result boundary redelivers;
-7. a crash after durable completion but before commit produces a safe duplicate;
-8. transient failure transactionally creates the next immediate attempt before source commit;
-9. permanent/exhausted failure reaches the DLQ before source commit;
-10. DLQ failure leaves the source offset uncommitted and applies backpressure;
-11. out-of-order completion never commits over an unfinished earlier offset; and
-12. rebalance and forced shutdown lose no acknowledged work.
+2. multiple jobs for one canonical `ownerId` always reach one partition and never execute
+   concurrently;
+3. one consumer group shares partitions across pods without simultaneous ownership;
+4. each pod respects sustained TPS and burst capacity;
+5. required-update failure pauses new work while heartbeats retain membership;
+6. recovery resumes consumption and drains lag;
+7. a crash before the durable result boundary redelivers;
+8. a crash after durable completion but before commit produces a safe duplicate;
+9. transient failure transactionally creates the next immediate attempt before source commit;
+10. permanent/exhausted failure reaches the DLQ before source commit;
+11. DLQ failure leaves the source offset uncommitted and applies backpressure;
+12. out-of-order completion never commits over an unfinished earlier offset; and
+13. rebalance and forced shutdown lose no acknowledged work.
 
 A load test demonstrates throughput and lag for the selected partitions, maximum replicas,
 per-pod TPS, realistic latency, and skewed keys. Evidence records configured and measured
@@ -416,7 +442,8 @@ or infrastructure requires a separately approved retention and rollback decision
 
 Spec 006 is complete when:
 
-1. executable jobs use a versioned work topic and documented deterministic partition key;
+1. executable jobs use a versioned work topic with canonical `ownerId` as the deterministic
+   partition key, preserved through retry and DLQ replay;
 2. worker pods pull through one consumer group with auto-commit disabled;
 3. a pod starts no new work while required downstream updates are failing;
 4. paused consumers maintain the polling/heartbeats needed to avoid unintended churn;
@@ -428,9 +455,11 @@ Spec 006 is complete when:
    source commit;
 9. duplicates, crashes, and rebalances create at most one logical terminal outcome per
    attempt;
-10. lag, throttling, pauses, commits, retries, and DLQ growth are observable and alerted;
-11. automated real-infrastructure tests cover the failure boundaries in Section 14; and
-12. cutover and rollback prevent concurrent ownership by old and new execution paths.
+10. no two jobs for the same `ownerId` execute concurrently, including when one partition
+    is processed with concurrency greater than one;
+11. lag, throttling, pauses, commits, retries, and DLQ growth are observable and alerted;
+12. automated real-infrastructure tests cover the failure boundaries in Section 14; and
+13. cutover and rollback prevent concurrent ownership by old and new execution paths.
 
 ## 17. Out of Scope
 

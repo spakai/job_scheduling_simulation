@@ -62,7 +62,8 @@ The target gaps are:
 
 - Preserve the existing simulator and visibility semantics.
 - Treat broker acknowledgement as submission acknowledgement, never completion.
-- Require a stable client-generated `jobId`; reject conflicting duplicates.
+- Require stable client-generated `jobId`, `ownerId`, and `ownerType`; use canonical
+  `ownerId` as the Kafka key and reject conflicting duplicates.
 - Keep all work immediately eligible in Spec 006.
 - Use Kafka transactions for output records plus consumed offsets.
 - Treat external handler execution as at least once and require domain idempotency.
@@ -82,6 +83,7 @@ src/job_visibility/
     consumer.py                  poll/assignment/pause loop
     worker.py                    dispatch and outcome orchestration
     offsets.py                   per-partition contiguous offset tracker
+    owner_gate.py                one active handler per ownerId
     rate_limit.py                virtual-clock-compatible token bucket
     backpressure.py              RUNNING/PAUSED/PROBING controller
     inbox.py                     Kafka-backed idempotency state
@@ -133,20 +135,25 @@ No production handler traffic moves until Phases 0–6 pass their gates.
 
 Tasks:
 
-1. Freeze topic names, consumer group, default `jobId` key, and partition-count assumptions.
-2. Define versioned request, result, lifecycle-reference, retry, and DLQ models.
-3. Define immutable-field comparison and `(jobId, attempt)` identity rules.
-4. Define the failure taxonomy: success, retryable, permanent, exhausted, and conflict.
-5. Define exact safe commit boundaries and failpoint names around each boundary.
-6. Decide the Kafka state-store implementation and restore/readiness contract.
-7. Define timing-budget relationships for poll, session, handler, transaction, and shutdown.
-8. Add serialization, compatibility, key-selection, and error-classification unit tests.
+1. Freeze topic names, consumer group, canonical `ownerId` key encoding, `ownerType`
+   semantics, and partition-count assumptions.
+2. Define a deterministic owner-selection rule per workload and forbid mixing subscriber
+   and business-group scopes for the same ordering requirement.
+3. Define versioned request, result, lifecycle-reference, retry, and DLQ models.
+4. Define immutable-field comparison and `(jobId, attempt)` identity rules.
+5. Define the failure taxonomy: success, retryable, permanent, exhausted, and conflict.
+6. Define exact safe commit boundaries and failpoint names around each boundary.
+7. Decide the Kafka state-store implementation and restore/readiness contract.
+8. Define timing-budget relationships for poll, session, handler, transaction, and shutdown.
+9. Add serialization, compatibility, `ownerId` normalization/key-selection, ownership, and
+   error-classification unit tests.
 
 Exit criteria:
 
 - Every acceptance scenario has a named durable boundary and expected offset.
 - Schema compatibility checks run locally and in CI.
 - No contract contains future-delivery semantics.
+- Tests prove namespace-safe keys and reject mixed owner selection for one workload.
 
 ### Phase 1 — Topics, security, and producer path
 
@@ -156,9 +163,11 @@ Tasks:
    topics with partitions, replication, retention, and cleanup policy.
 2. Add least-privilege producer, worker, visibility, and DLQ-operator ACL definitions.
 3. Implement a shared producer configured for idempotence, required acknowledgements,
-   retries, delivery timeout, schema validation, keying, and payload bounds.
+   retries, delivery timeout, schema validation, canonical `ownerId` keying, and payload
+   bounds.
 4. Return success only after broker acknowledgement and expose ambiguous timeout semantics.
-5. Add duplicate same-session and new-session producer tests.
+5. Add duplicate same-session/new-session tests plus rejection of null, `jobId`,
+   inconsistently normalized, or client-selected partition keys.
 6. Implement an optional stateless HTTP submission adapter using the same producer library.
 7. Add startup validation that rejects missing topics, incompatible schemas, or unsafe
    producer settings in non-local environments.
@@ -177,17 +186,22 @@ Tasks:
 2. Add bounded poll batches, per-partition queues, and global/per-partition concurrency.
 3. Implement assignment and revocation callbacks with ownership generation/fencing state.
 4. Implement the contiguous offset tracker; never advance over unfinished earlier records.
-5. Separate polling/heartbeats from handler dispatch so throttling does not exceed the poll
+5. Implement a bounded keyed execution gate allowing at most one active handler per
+   `ownerId`, even when multiple records from its partition have been fetched.
+6. Separate polling/heartbeats from handler dispatch so throttling does not exceed the poll
    interval.
-6. Add deterministic tests for fetch, queue, start, completion, out-of-order completion,
+7. Add deterministic tests for fetch, queue, owner blocking, completion, out-of-order completion,
    revoke, and commit transitions.
-7. Add a no-side-effect handler to prove multi-pod partition sharing against real Kafka.
+8. Add a no-side-effect handler to prove multi-pod partition sharing and owner affinity
+   against real Kafka.
 
 Exit criteria:
 
 - No offset is committed at fetch, queue, or start.
 - Concurrent completion commits only the highest contiguous safe offset.
 - Each partition has at most one active group owner.
+- Two jobs with the same `ownerId` never execute concurrently; different owners sharing a
+  partition may do so safely.
 
 ### Phase 3 — Transactions and idempotency
 
@@ -234,7 +248,8 @@ Exit criteria:
 
 Tasks:
 
-1. Implement bounded immediate retry by publishing `attempt + 1` with immutable fields.
+1. Implement bounded immediate retry by publishing `attempt + 1` with immutable fields and
+   the original serialized `ownerId` key.
 2. Publish retry/lifecycle plus source offset in one Kafka transaction.
 3. Implement the governed DLQ envelope with original coordinates and sanitized failure.
 4. Publish terminal result/lifecycle/DLQ plus source offset in one transaction.
@@ -243,7 +258,8 @@ Tasks:
 7. Stop readiness before drain and fit the drain budget within Kubernetes termination grace.
 8. Add failpoints before/after external effect, each output send, transaction commit, and
    revocation.
-9. Add audited manual replay tooling that emits a new work record without editing history.
+9. Add audited manual replay tooling that emits a new work record with the original
+   `ownerId` key without editing history.
 
 Exit criteria:
 
@@ -303,11 +319,12 @@ Exit criteria:
 
 | Area | Unit | Integration | Failure/load proof |
 | --- | --- | --- | --- |
-| Contracts/keying | Schema, immutable fields, keys | Registry compatibility | Partition expansion/skew review |
+| Contracts/keying | Schema, immutable fields, canonical owner keys | Registry compatibility and same-owner affinity | Partition expansion/owner-skew review |
 | Producer | Ack/timeout mapping | Real broker acknowledgement | Ambiguous timeout and retry |
 | Offsets | Contiguous tracker | Multi-partition manual commits | Crash/revoke at every boundary |
 | Transactions | State machine | `read_committed` atomic visibility | Abort, timeout, fencing |
 | Idempotency | Duplicate/conflict reducer | State restore and reassignment | Crash after external effect |
+| Owner serialization | Keyed gate | Same owner never overlaps | Hot-owner load and rebalance |
 | TPS | Virtual-clock token bucket | Per-pod measured rate | Replica scale and bursts |
 | Backpressure | Transition model | Pause with heartbeat polls | Output-topic outage/recovery |
 | Retry/DLQ | Classification/envelope | Transactional handoff | Poison, exhaustion, DLQ outage |
@@ -345,7 +362,7 @@ Database deletion is never part of automated cutover.
 
 | Specification concern | Delivery phase | Primary proof |
 | --- | --- | --- |
-| Kafka topic and partitioning | 0–1 | Schema/key and real partition tests |
+| Kafka topic and owner partitioning | 0–2 | Canonical key, affinity, and non-overlap tests |
 | Direct client producer | 1 | Broker ack, auth, duplicate tests |
 | Pull pods/manual commit | 2 | Offset and ownership tests |
 | Kafka-backed idempotency | 3 | Restore, duplicate, conflict tests |
@@ -393,10 +410,12 @@ Implementation is complete when:
 3. workers manually control source offsets with auto-commit disabled;
 4. required Kafka outputs and offsets commit atomically;
 5. matching duplicates converge and conflicting duplicates are quarantined;
-6. handlers demonstrate durable external-side-effect idempotency;
-7. every pod enforces configured TPS, burst, concurrency, and queue limits;
-8. output failure pauses new work while consumer heartbeats continue;
-9. retry, DLQ, rebalance, shutdown, and crash scenarios lose no acknowledged work;
-10. status and lifecycle remain observable through Kafka-derived projections;
-11. CI and release evidence cover the complete matrix; and
-12. migration, rollback, documentation, and legacy retirement are approved and reproducible.
+6. all retries and DLQ replays preserve canonical `ownerId`, and no two jobs for the same
+   owner execute concurrently;
+7. handlers demonstrate durable external-side-effect idempotency;
+8. every pod enforces configured TPS, burst, concurrency, and queue limits;
+9. output failure pauses new work while consumer heartbeats continue;
+10. retry, DLQ, rebalance, shutdown, and crash scenarios lose no acknowledged work;
+11. status and lifecycle remain observable through Kafka-derived projections;
+12. CI and release evidence cover the complete matrix; and
+13. migration, rollback, documentation, and legacy retirement are approved and reproducible.

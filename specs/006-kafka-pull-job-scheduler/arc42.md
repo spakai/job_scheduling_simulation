@@ -39,7 +39,7 @@ not part of this runtime.
 | Priority | Goal | Architectural response |
 | ---: | --- | --- |
 | 1 | No acknowledged request is lost | Kafka acknowledgement is submission acknowledgement; offsets advance only at safe boundaries. |
-| 2 | Safe duplicate delivery | Stable `jobId`, partition ordering, Kafka-backed inbox state, and idempotent handlers. |
+| 2 | Owner serialization and safe duplicates | Stable `ownerId` partitioning, keyed execution, Kafka-backed inbox state, and idempotent handlers. |
 | 3 | Bounded dependency load | Per-pod token bucket plus bounded concurrency and queues. |
 | 4 | Failure backpressure | Assigned partitions pause while required Kafka writes fail; polling continues for heartbeats. |
 | 5 | Durable failure handling | Permanent/exhausted requests reach a dedicated DLQ before source commit. |
@@ -62,7 +62,7 @@ not part of this runtime.
 ### 2.1 Functional constraints
 
 - Spec 006 requests are eligible immediately when published.
-- The client supplies an immutable, globally stable `jobId` and Kafka key.
+- The client supplies immutable `jobId`, `ownerId`, and `ownerType`; `ownerId` is the Kafka key.
 - All workers for a logical workload share one consumer group.
 - Auto-commit is disabled.
 - Success, retry, and DLQ source offsets advance only after their required durable outputs.
@@ -135,12 +135,14 @@ configuration remain architecture contracts.
 
 ## 4. Solution Strategy
 
-1. A client validates and publishes a keyed, versioned command with idempotent production.
+1. A client validates and publishes a versioned command keyed by canonical `ownerId` with
+   idempotent production.
 2. Kafka acknowledges durable submission; execution remains asynchronous.
 3. A group assigns each partition to one worker pod.
 4. The pod polls bounded batches and dispatches only when queue, concurrency, TPS, and
    backpressure gates permit.
-5. A Kafka-backed inbox/result state identifies completed or conflicting duplicates.
+5. A keyed execution gate permits at most one active job per `ownerId`; Kafka-backed
+   inbox/result state identifies completed or conflicting duplicates.
 6. The handler performs its side effect through a stable operation idempotency key.
 7. The worker transactionally writes result/lifecycle/retry/DLQ records and source offsets.
 8. Publication failure pauses affected work while heartbeat polls preserve membership.
@@ -186,6 +188,7 @@ flowchart LR
     consumer["Kafka consumer loop"]
     capacity["Capacity gate"]
     limiter["Token-bucket limiter"]
+    ownerGate["Per-owner execution gate"]
     inbox["Kafka-backed inbox"]
     registry["Handler registry"]
     handler["Job handler"]
@@ -195,7 +198,7 @@ flowchart LR
     pressure["Backpressure controller"]
     health["Health and telemetry"]
 
-    consumer --> capacity --> limiter --> inbox --> registry --> handler --> outcome
+    consumer --> capacity --> limiter --> ownerGate --> inbox --> registry --> handler --> outcome
     outcome --> publisher --> offsets
     publisher -->|"Failure/success signal"| pressure
     pressure -->|"Pause/resume assignments"| consumer
@@ -295,11 +298,25 @@ Auto-commit is disabled. Output records and consumed offsets use Kafka transacti
 `read_committed` readers. Concurrent partition processing advances only through contiguous
 completed offsets. Transactional IDs are unique and fenced across pod generations.
 
-### 8.2 Idempotency
+### 8.2 Owner affinity and idempotency
 
-The domain key is `(jobId, attempt)`. Matching duplicates converge; conflicting immutable
-payloads are rejected. Kafka-backed inbox state is restored before a partition accepts
-work. External targets receive a stable operation key or use a durable conditional write.
+`ownerId` is a canonical subscriber or business-group identifier and is the serialized
+Kafka key. `ownerType` declares whether it represents `SUBSCRIBER` or `GROUP`. All producers
+use identical normalization/serialization, never set a null key or explicit partition, and
+preserve the original key for retries and DLQ replay. Partition count remains fixed after
+cutover unless an ordering-impact migration is approved.
+
+The owner-selection rule is stable per workload: subscriber serialization always uses the
+subscriber owner, while group serialization always uses the business-group owner. Mixing
+those scopes cannot guarantee subscriber affinity. Canonical keys include a namespace such
+as `subscriber:123` or `group:123`. The Kafka consumer `group.id` names a worker fleet and
+has no relationship to a business group owner.
+
+Partition affinity does not itself prevent concurrent dispatch inside a worker. A per-owner
+gate permits at most one active job for each `ownerId`; different owners sharing a partition
+may execute concurrently behind contiguous offset tracking. The domain idempotency key
+remains `(jobId, attempt)`. Matching duplicates converge, conflicting immutable payloads are
+rejected, and Kafka-backed state is restored before accepting work.
 
 ### 8.3 Backpressure and rate limiting
 
@@ -325,7 +342,7 @@ aborts, retries, DLQ, rebalances, and idempotent duplicates.
 | --- | --- | --- | --- |
 | ADR-006-01 | Kafka replaces the scheduler database in the new path. | Removes database polling and makes the queue the pull boundary. | No database queries for operational job state. |
 | ADR-006-02 | Only immediately eligible jobs are accepted. | Kafka partitions are not delayed queues. | Future scheduling needs another service. |
-| ADR-006-03 | Default key is `jobId`. | Preserves per-job order and duplicate locality. | Key skew limits throughput. |
+| ADR-006-03 | Kafka key is canonical `ownerId`, representing a subscriber or business group. | Keeps every owner's jobs in one partition. | Large owners can cause skew and head-of-line blocking. |
 | ADR-006-04 | One consumer group represents one worker fleet. | Kafka distributes partition ownership. | Replicas beyond partitions are idle. |
 | ADR-006-05 | TPS is enforced per pod with a token bucket. | Simple and locally enforceable. | Fleet TPS changes with replica count. |
 | ADR-006-06 | Required publication failure pauses partitions. | Prevents consuming work whose outcome cannot be made durable. | Lag grows visibly during outage. |
@@ -343,6 +360,7 @@ aborts, retries, DLQ, rebalances, and idempotent duplicates.
 | Permanent poison record | DLQ/result/lifecycle and source offset commit atomically. |
 | Rebalance during concurrent work | No offset advances over unfinished earlier work. |
 | New producer session resubmits | Kafka-backed domain idempotency detects the duplicate. |
+| Two jobs for one owner are fetched together | Per-owner gate allows only one active handler for that `ownerId`. |
 
 ## 11. Risks and Technical Debt
 
@@ -350,7 +368,7 @@ aborts, retries, DLQ, rebalances, and idempotent duplicates.
 | --- | --- | --- |
 | External side effect is not transactional with Kafka | Duplicate physical calls | Target idempotency keys, durable conditional writes, fault tests. |
 | Direct Kafka access expands client responsibility | Schema/security/configuration drift | Shared producer SDK or stateless submission API. |
-| Hot keys or too few partitions | Low throughput and head-of-line blocking | Capacity test, skew metrics, reviewed key strategy. |
+| Large owners or too few partitions | Low throughput and head-of-line blocking | Per-owner volume tests, skew metrics, fixed reviewed partition strategy. |
 | Retry is immediate | Dependency amplification | TPS gate, attempt limit, backpressure; add timer service only by new design. |
 | Kafka-backed inbox restore is slow | Rebalance recovery delay | Bounded state, standby replicas where justified, restore metrics. |
 | Transaction misconfiguration | Duplicated/hidden outputs | Startup validation, unique IDs, `read_committed`, integration tests. |
@@ -366,3 +384,5 @@ aborts, retries, DLQ, rebalances, and idempotent duplicates.
 | Immediate retry | A new attempt published without a scheduled delay. |
 | DLQ | Kafka topic containing permanent or exhausted failures plus source coordinates. |
 | Logical outcome | Domain result after duplicate deliveries are collapsed by idempotency. |
+| `ownerId` | Canonical Kafka key identifying the subscriber or business group whose jobs must not overlap. |
+| `ownerType` | Metadata declaring whether `ownerId` represents `SUBSCRIBER` or `GROUP`. |
