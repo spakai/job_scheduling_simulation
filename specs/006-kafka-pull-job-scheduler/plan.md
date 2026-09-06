@@ -52,7 +52,7 @@ The target gaps are:
 | No work-command topic/schema | Clients cannot submit executable work through Kafka. |
 | Worker claims database rows | Execution cannot scale through Kafka partition ownership. |
 | No transactional consume-transform-produce boundary | Output and source offset can diverge. |
-| No Kafka-backed inbox | New-session duplicate submissions can repeat side effects. |
+| No durable job deduplication | New-session submissions and redelivery can repeat side effects; accepted for Spec 006. |
 | No per-pod TPS gate | Replica concurrency can overload dependencies. |
 | No partition pause controller | Output failures allow unsafe intake or consumer churn. |
 | Retry depends on database timing | Kafka-only immediate retry semantics are absent. |
@@ -63,10 +63,11 @@ The target gaps are:
 - Preserve the existing simulator and visibility semantics.
 - Treat broker acknowledgement as submission acknowledgement, never completion.
 - Require stable client-generated `jobId`, `ownerId`, and `ownerType`; use canonical
-  `ownerId` as the Kafka key and reject conflicting duplicates.
+  `ownerId` as the Kafka key.
 - Keep all work immediately eligible in Spec 006.
 - Use Kafka transactions for output records plus consumed offsets.
-- Treat external handler execution as at least once and require domain idempotency.
+- Treat handler execution as at least once and measure duplicates; durable deduplication is
+  deferred to the next specification.
 - Keep every queue, deadline, retry count, pause, and drain bounded.
 - Test offset boundaries with real Kafka and deterministic failpoints.
 - Make the old and new execution paths mutually exclusive during migration.
@@ -86,7 +87,6 @@ src/job_visibility/
     owner_gate.py                one active handler per ownerId
     rate_limit.py                virtual-clock-compatible token bucket
     backpressure.py              RUNNING/PAUSED/PROBING controller
-    inbox.py                     Kafka-backed idempotency state
     transactions.py              output plus source-offset transaction
     config.py                    validated timing/topic/TPS configuration
     health.py                    readiness/liveness and metrics
@@ -119,7 +119,7 @@ specs/006-kafka-pull-job-scheduler/
 Phase 0  Contracts, decisions, and executable test fixtures
 Phase 1  Topic, schema, security, and producer path
 Phase 2  Consumer foundation and manual offset tracking
-Phase 3  Kafka transactions and Kafka-backed idempotency
+Phase 3  Kafka transactions and stale-generation fencing
 Phase 4  TPS limiting, bounded concurrency, and backpressure
 Phase 5  Retry, DLQ, rebalance, and shutdown safety
 Phase 6  Observability, deployment, load, and resilience evidence
@@ -159,7 +159,7 @@ Exit criteria:
 
 Tasks:
 
-1. Add declarative configuration for work, result, inbox/changelog, lifecycle, and DLQ
+1. Add declarative configuration for work, result, lifecycle, and DLQ
    topics with partitions, replication, retention, and cleanup policy.
 2. Add least-privilege producer, worker, visibility, and DLQ-operator ACL definitions.
 3. Implement a shared producer configured for idempotence, required acknowledgements,
@@ -208,30 +208,24 @@ Exit criteria:
 - Two jobs with the same `ownerId` never execute concurrently; different owners sharing a
   partition may do so safely.
 
-### Phase 3 — Transactions and idempotency
+### Phase 3 — Transactions and stale-generation fencing
 
 Tasks:
 
 1. Give each pod/process generation a unique transactional producer ID.
 2. Implement begin, produce outputs, send group offsets, commit, and abort operations.
 3. Fence stale producer generations and classify transaction timeout/fencing failures.
-4. Implement Kafka-backed inbox/result state restoration keyed by `(jobId, attempt)`.
-5. Block readiness for assigned partitions until required state is restored.
-6. Return the recorded outcome for matching duplicates and quarantine conflicting immutable
-   duplicates.
-7. Thread a stable operation idempotency key into every handler contract.
-8. Adapt built-in handlers to demonstrate idempotent or conditional side effects.
-9. Hold an external call open across partition revocation, transfer the partition to a new
+4. Hold an external call open across partition revocation, transfer the partition to a new
    pod, and assert the former generation cannot commit Kafka outputs or offsets.
-10. Redeliver the held job to the new pod with the same operation id and assert the external
-    dependency returns the original idempotent outcome.
+5. Redeliver the held job to the new pod and record any duplicate handler execution.
+6. Emit duplicate-observation metrics keyed by job and attempt without suppressing work.
 
 Exit criteria:
 
 - A crash before transaction commit exposes neither outputs nor advanced offsets to
   `read_committed` consumers.
 - A committed transaction exposes outputs and offset together.
-- Replayed work and restored pods produce one logical outcome.
+- Replayed work may execute again, but Kafka outputs and offsets never partially commit.
 
 ### Phase 4 — TPS, concurrency, and backpressure
 
@@ -347,7 +341,7 @@ Exit criteria:
 | Producer | Ack/timeout mapping | Real broker acknowledgement | Ambiguous timeout and retry |
 | Offsets | Contiguous tracker and offset gaps | Multi-partition manual commits | Block 101 while 100/102 finish; crash/revoke boundaries |
 | Transactions | State machine | `read_committed` atomic visibility | Abort, timeout, stale-generation fencing |
-| Idempotency | Duplicate/conflict reducer | State restore and reassignment | Crash after external effect |
+| Duplicate observation | Job/attempt counters | Repeated delivery visibility | Crash after external effect |
 | Consumer ownership | Assignment generation | One partition owner per group | Same-group rebalance and isolated split-group duplicate proof |
 | Owner serialization | Keyed gate | Same owner never overlaps | Hot-owner load and rebalance |
 | TPS | Virtual-clock token bucket | Per-pod measured rate | Replica scale and bursts |
@@ -364,22 +358,22 @@ CI tiers are:
    bounded single-broker transaction suite.
 2. **Nightly:** `PULL-CAP-01` through `PULL-CAP-04`, `PULL-SKEW-01`, `PULL-POD-01`,
    `PULL-BP-01`, `PULL-REB-01`, `PULL-REB-02`, `PULL-OFF-01`, isolated `PULL-GRP-01`,
-   multi-broker Kafka, state restore, and TPS scenarios.
+   multi-broker Kafka and TPS scenarios.
 3. **Release:** nightly suite plus repeated migration/rollback rehearsal and representative
    capacity evidence.
 
 Evidence includes effective topic configuration, schema versions, consumer assignments,
 committed offsets, transaction state, result/DLQ coordinates, per-pod TPS measurements,
-pause transitions, lag/age, owner distribution and overlap count, queue high-water marks,
-state restore time, process restarts, and backlog recovery duration.
+pause transitions, lag/age, owner distribution and overlap count, duplicate execution count,
+queue high-water marks, process restarts, and backlog recovery duration.
 Credentials and governed payload fields are redacted.
 
 ## 9. Migration and Rollback
 
 The cutover unit is an explicitly reconciled population, not a time window inferred from
 logs. Legacy claim acquisition is disabled before migration publication. The manifest
-records each source job and its acknowledged Kafka coordinates; rerunning the migration
-uses the same `jobId` and is duplicate-safe.
+records each source job and its acknowledged Kafka coordinates. Rerunning migration may
+create duplicate execution and therefore requires operator reconciliation in Spec 006.
 
 Rollback stops new consumer dispatch first and drains or abandons in-flight Kafka work.
 Legacy workers may restart only for a population proven not to have a Kafka logical
@@ -393,7 +387,7 @@ Database deletion is never part of automated cutover.
 | Kafka topic and owner partitioning | 0–2 | Canonical key, affinity, and non-overlap tests |
 | Direct client producer | 1 | Broker ack, auth, duplicate tests |
 | Pull pods/manual commit | 2 | Offset and ownership tests |
-| Kafka-backed idempotency | 3 | Restore, duplicate, conflict tests |
+| Duplicate-execution limitation | 3, 5 | Repeat-delivery metrics and failure evidence |
 | Transactional outputs/offsets | 3, 5 | Crash and `read_committed` tests |
 | Per-pod TPS | 4 | Virtual-clock and load measurements |
 | Update-failure backpressure | 4 | Pause/heartbeat/recovery test |
@@ -411,7 +405,7 @@ Database deletion is never part of automated cutover.
 
 ### Gate B — Kafka correctness
 
-- Transactions, manual offsets, inbox restoration, duplicate behavior, and fencing pass
+- Transactions, manual offsets, documented duplicate behavior, and fencing pass
   real-Kafka fault tests.
 
 ### Gate C — Flow control
@@ -437,13 +431,12 @@ Implementation is complete when:
    outbox dependency;
 3. workers manually control source offsets with auto-commit disabled;
 4. required Kafka outputs and offsets commit atomically;
-5. matching duplicates converge and conflicting duplicates are quarantined;
+5. duplicate executions/results are measured and documented as an accepted limitation;
 6. all retries and DLQ replays preserve canonical `ownerId`, and no two jobs for the same
    owner execute concurrently;
-7. handlers demonstrate durable external-side-effect idempotency;
-8. every pod enforces configured TPS, burst, concurrency, and queue limits;
-9. output failure pauses new work while consumer heartbeats continue;
-10. retry, DLQ, rebalance, shutdown, and crash scenarios lose no acknowledged work;
-11. status and lifecycle remain observable through Kafka-derived projections;
-12. CI and release evidence cover the complete matrix; and
-13. migration, rollback, documentation, and legacy retirement are approved and reproducible.
+7. every pod enforces configured TPS, burst, concurrency, and queue limits;
+8. output failure pauses new work while consumer heartbeats continue;
+9. retry, DLQ, rebalance, shutdown, and crash scenarios lose no acknowledged work;
+10. status and lifecycle remain observable through Kafka-derived projections;
+11. CI and release evidence cover the complete matrix; and
+12. migration, rollback, documentation, and legacy retirement are approved and reproducible.

@@ -20,7 +20,7 @@ Depends on: [`../002-real-persistence-kafka/spec.md`](../002-real-persistence-ka
 - [8. Backpressure](#8-backpressure)
 - [9. Per-Pod TPS Rate Limiting](#9-per-pod-tps-rate-limiting)
 - [10. Retry, DLQ, and Manual Commit Semantics](#10-retry-dlq-and-manual-commit-semantics)
-- [11. Rebalancing, Shutdown, and Idempotency](#11-rebalancing-shutdown-and-idempotency)
+- [11. Rebalancing, Shutdown, and Duplicate Semantics](#11-rebalancing-shutdown-and-duplicate-semantics)
 - [12. Configuration](#12-configuration)
 - [13. Observability and Operations](#13-observability-and-operations)
 - [14. Testing Strategy](#14-testing-strategy)
@@ -39,7 +39,8 @@ durable processing boundary.
 
 The design provides at-least-once delivery. It does not claim exactly-once execution of an
 external side effect. Duplicate delivery is expected after crashes, timeouts, and consumer
-group rebalances and must be safe through stable job identity and idempotent handlers.
+group rebalances. This specification preserves delivery and offset safety but permits
+duplicate handler execution; durable job deduplication is deferred to a later specification.
 
 ## 2. Scope
 
@@ -90,9 +91,8 @@ it until `scheduledAt`, because doing so would block later records in the partit
 scheduling requires a separate durable timer service and is outside this specification.
 
 `job-results.v1` is an immutable result stream keyed by `jobId`. It replaces scheduler
-status/attempt rows as the operational result record. A compacted Kafka state/changelog
-topic may additionally back the worker's idempotency state; it is Kafka-owned state, not a
-scheduler database.
+status/attempt rows as the operational result record. Duplicate results may exist for a
+redelivered or resubmitted `(jobId, attempt)` until a later specification adds deduplication.
 
 ## 4. Topics and Partitioning
 
@@ -144,7 +144,7 @@ Each work record contains at least:
 | Field | Requirement |
 | --- | --- |
 | `schemaVersion` | Required work-envelope version. |
-| `jobId` | Stable globally unique job and idempotency key. |
+| `jobId` | Stable globally unique job correlation identifier. |
 | `ownerId` | Required stable subscriber or business-group identifier; also the Kafka record key. |
 | `ownerType` | `SUBSCRIBER` or `GROUP`; declares the serialization scope represented by `ownerId`. |
 | `correlationId` | Trace/business correlation identifier. |
@@ -170,10 +170,9 @@ submission acknowledgement. A timeout is ambiguous: the client retries with the 
 `jobId` and identical immutable request fields.
 
 Kafka producer idempotence does not deduplicate submissions made in a new producer session.
-The client-supplied `jobId` is therefore mandatory. Workers maintain a Kafka-backed inbox
-or result state keyed by `(jobId, attempt)` and reject a duplicate whose immutable fields
-differ. A matching duplicate returns/re-emits the recorded outcome without repeating the
-business side effect.
+The client-supplied `jobId` is mandatory for correlation, but Spec 006 does not check a
+durable `(jobId, attempt)` registry. A repeated record may repeat handler execution and emit
+another result. Clients should avoid intentional duplicate submission.
 
 The producer must not wait for worker execution before acknowledging submission. It may
 optionally wait for a result by consuming `job-results.v1` using `jobId` correlation, but
@@ -199,7 +198,7 @@ Each worker pod must:
 3. poll records in bounded batches;
 4. maintain bounded handler concurrency and a bounded local queue;
 5. acquire a per-pod rate-limit permit immediately before starting a handler;
-6. validate and idempotently process the job;
+6. validate and process the job;
 7. publish the outcome and required lifecycle records;
 8. create a retry or DLQ handoff when required; and
 9. commit only offsets whose preceding records in that partition are also safe to commit.
@@ -255,8 +254,8 @@ only by a temporary downstream outage.
 
 Every worker pod has an independent token-bucket limiter. `rateLimitTps` is the sustained
 number of handler starts per second and `rateLimitBurst` is the maximum accumulated burst.
-A token is consumed immediately before a handler begins. Polling, validation, idempotency
-lookup, offset commits, and internal dependency calls do not consume separate tokens.
+A token is consumed immediately before a handler begins. Polling, validation, offset
+commits, and internal dependency calls do not consume separate tokens.
 
 The approximate configured fleet ceiling is:
 
@@ -279,9 +278,9 @@ unlimited.
 
 After successful execution, the consumer publishes the result and lifecycle records and
 may manually commit `processed offset + 1` only after those records are acknowledged and
-the business side effect is complete or idempotently recorded. Where supported, the result,
-lifecycle records, Kafka-backed inbox update, and consumed offset must be committed in one
-Kafka transaction. A transaction or commit failure leaves the delivery uncommitted.
+the handler returns. The result, lifecycle records, and consumed offset must be committed in
+one Kafka transaction. A transaction or commit failure leaves the delivery uncommitted and
+may cause the handler to run again.
 
 ### 10.2 Transient failure
 
@@ -312,8 +311,8 @@ records before committing the source offset. If any publication fails, the sourc
 remains uncommitted and backpressure applies.
 
 Kafka transactions should atomically publish result/lifecycle/retry/DLQ records and advance
-the consumed offset. They cannot make an external business side effect atomic, so handler
-idempotency remains mandatory.
+the consumed offset. They cannot make an external business side effect atomic. Duplicate
+physical side effects are an explicitly accepted Spec 006 limitation.
 
 ### 10.4 Forbidden commit points
 
@@ -326,27 +325,23 @@ The source offset must not be committed:
 - over an unfinished earlier record in the same partition; or
 - during revocation unless the record already reached a safe durable boundary.
 
-## 11. Rebalancing, Shutdown, and Idempotency
+## 11. Rebalancing, Shutdown, and Duplicate Semantics
 
 On partition revocation, the pod stops dispatching from that partition, waits only for the
 bounded drain deadline, commits the highest contiguous safe offset, and abandons remaining
-local work for safe redelivery. Late completion from a revoked owner must be rejected by a
-durable fencing or idempotency check.
+local work for redelivery. A late Kafka transaction from a revoked owner must be fenced;
+the handler itself may already have produced a duplicate external effect.
 
 On shutdown, readiness fails first, new dispatch stops, in-flight work drains for a bounded
 deadline, safe offsets are committed, and the consumer leaves the group. The deadline must
 fit inside the platform termination grace period. `max.poll.interval.ms`, session timeout,
 batch size, maximum handler time, and shutdown deadline form one reviewed timing budget.
 
-End-to-end delivery is at least once. Before a non-repeatable side effect, a handler uses
-`jobId` plus `attempt`, or a stable operation ID, as an idempotency key. `ownerId` controls
-serialization and is not a replacement for the job idempotency key. Where the target
-does not support idempotency keys, the handler uses a durable inbox, conditional update, or
-compare-and-set boundary. An in-memory completed set is insufficient.
-
-One `(jobId, attempt)` may produce at most one logical terminal outcome. Replayed success,
-retry, and DLQ records converge without overwriting immutable fields or regressing terminal
-state.
+End-to-end delivery is at least once. Kafka transactions prevent partial Kafka output and
+offset commits, but do not suppress a repeated `(jobId, attempt)` or atomically include an
+external side effect. Duplicate requests, results, and physical effects are possible after
+ambiguous failures, rebalances, restarts, or producer resubmission. Durable deduplication,
+retention/TTL, conflict detection, and external-effect idempotency belong to the next spec.
 
 ## 12. Configuration
 
@@ -391,7 +386,7 @@ repeated rebalances, update or commit failure, DLQ growth, no active consumers, 
 hot-partition skew.
 
 Runbooks define how to pause/resume the group, inspect a DLQ record, fix its cause, replay
-with authorization, and prove replay caused no duplicate logical outcome. Replay is audited
+with authorization, and measure any duplicate execution caused by replay. Replay is audited
 and creates a new work record; original Kafka records are not edited.
 
 ## 14. Testing Strategy
@@ -410,7 +405,8 @@ Integration tests against real Kafka prove:
 5. required-update failure pauses new work while heartbeats retain membership;
 6. recovery resumes consumption and drains lag;
 7. a crash before the durable result boundary redelivers;
-8. a crash after durable completion but before commit produces a safe duplicate;
+8. a crash after handler completion but before commit redelivers and documents possible
+   duplicate execution;
 9. transient failure transactionally creates the next immediate attempt before source commit;
 10. permanent/exhausted failure reaches the DLQ before source commit;
 11. DLQ failure leaves the source offset uncommitted and applies backpressure;
@@ -419,8 +415,8 @@ Integration tests against real Kafka prove:
 14. two pods in one `group.id` never hold a stable assignment for the same partition;
 15. a former pod finishing after revocation cannot commit Kafka outputs or offsets under a
     stale generation;
-16. redelivery to the new pod uses the same external operation id and converges without a
-    duplicate logical effect; and
+16. redelivery to the new pod is observed as possible duplicate execution without source
+    offset loss; and
 17. accidentally configuring two worker `group.id` values is rejected by deployment
     validation or detected by an acceptance guard.
 
@@ -446,10 +442,10 @@ The chaos harness from Spec 005 must add these bounded scenarios:
 | `PULL-CAP-03` | 20,000 requests compressed into ten minutes (about 33.4 requests/second) | Rate limiting caps starts near 30/second, excess becomes observable lag, and the backlog drains after the burst. |
 | `PULL-CAP-04` | 20,000 requests compressed into one minute (about 333.4 requests/second) | Intake remains durable, memory/queues stay bounded, no offsets are skipped, and recovery time is measured. |
 | `PULL-SKEW-01` | One hot `ownerId` receives 50% of requests | That owner never overlaps; its partition skew and head-of-line effects are observable without corrupting other partitions. |
-| `PULL-POD-01` | Terminate one of three pods during the ten-minute burst profile | Rebalance is bounded, ownership remains exclusive, duplicates converge, and remaining pods obey their own TPS limits. |
+| `PULL-POD-01` | Terminate one of three pods during the ten-minute burst profile | Rebalance is bounded, duplicate executions are measured, and remaining pods obey their own TPS limits. |
 | `PULL-BP-01` | Fail result/lifecycle publication during the burst | Affected partitions pause without source commits, heartbeat polls continue, and backlog drains after recovery. |
 | `PULL-REB-01` | Repeated controlled rebalances with concurrent owners | No owner executes concurrently across generations and no offset advances over incomplete work. |
-| `PULL-REB-02` | Hold an external call in the old pod across revocation, then assign its partition to a new pod | The stale Kafka transaction is fenced, the source offset is not skipped, and redelivery converges through external idempotency. |
+| `PULL-REB-02` | Hold an external call in the old pod across revocation, then assign its partition to a new pod | The stale Kafka transaction is fenced, the source offset is not skipped, and duplicate execution is measured. |
 | `PULL-OFF-01` | Complete offsets 100 and 102 while offset 101 remains blocked | The committed next offset is 101, never 103; releasing 101 then permits commit through 103. |
 | `PULL-GRP-01` | Start otherwise identical workers with two different `group.id` values in an isolated test | The test demonstrates duplicate delivery and proves production validation/alerting prevents this topology. |
 
@@ -497,8 +493,8 @@ Spec 006 is complete when:
 7. retry offsets are committed only after the next immediate attempt is acknowledged;
 8. permanent/exhausted failures are acknowledged in the DLQ and durably recorded before
    source commit;
-9. duplicates, crashes, and rebalances create at most one logical terminal outcome per
-   attempt;
+9. duplicate executions and results are observable and documented as an accepted
+   at-least-once limitation;
 10. no two jobs for the same `ownerId` execute concurrently, including when one partition
     is processed with concurrency greater than one;
 11. lag, throttling, pauses, commits, retries, and DLQ growth are observable and alerted;
@@ -508,6 +504,8 @@ Spec 006 is complete when:
 ## 17. Out of Scope
 
 - Exactly-once execution of arbitrary external side effects.
+- Durable `(jobId, attempt)` deduplication, TTL policy, conflicting-duplicate detection, and
+  external-effect idempotency; these are deferred to the next specification.
 - A globally exact TPS limit across replicas; this specification limits each pod.
 - Kafka topic auto-scaling or automatic partition-count changes.
 - Future/delayed job scheduling and delayed retry; both require a separate timer service.

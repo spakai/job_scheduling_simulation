@@ -39,7 +39,7 @@ not part of this runtime.
 | Priority | Goal | Architectural response |
 | ---: | --- | --- |
 | 1 | No acknowledged request is lost | Kafka acknowledgement is submission acknowledgement; offsets advance only at safe boundaries. |
-| 2 | Owner serialization and safe duplicates | Stable `ownerId` partitioning, keyed execution, Kafka-backed inbox state, and idempotent handlers. |
+| 2 | Owner serialization and offset safety | Stable `ownerId` partitioning, keyed execution, and transactional Kafka outputs/offsets. |
 | 3 | Bounded dependency load | Per-pod token bucket plus bounded concurrency and queues. |
 | 4 | Failure backpressure | Assigned partitions pause while required Kafka writes fail; polling continues for heartbeats. |
 | 5 | Durable failure handling | Permanent/exhausted requests reach a dedicated DLQ before source commit. |
@@ -52,7 +52,7 @@ not part of this runtime.
 | --- | --- |
 | Client teams | How to publish safely, interpret acknowledgement, and correlate results. |
 | Platform engineers | Topic capacity, credentials, quotas, rebalances, and transactions. |
-| Worker owners | Handler idempotency, rate limits, concurrency, and shutdown. |
+| Worker owners | At-least-once handling, rate limits, concurrency, and shutdown. |
 | Operations | Backlog, pauses, DLQ recovery, replay, and hot partitions. |
 | Audit/support | Immutable request, outcome, lifecycle, and failure evidence. |
 | Security | Direct client access, payload governance, and replay permissions. |
@@ -85,10 +85,9 @@ not part of this runtime.
 - There is no native future scheduling or delayed retry. A separate timer service would be
   required and is outside Spec 006.
 - Status, search, audit, and attempts are derived from Kafka lifecycle/result projections.
-- Producer idempotence does not deduplicate a retry from a new producer session; domain
-  idempotency remains mandatory.
-- Kafka cannot atomically include an arbitrary external business side effect. Handlers must
-  provide an idempotency key or durable conditional boundary.
+- Producer idempotence does not deduplicate a retry from a new producer session.
+- Kafka cannot atomically include an arbitrary external business side effect; duplicate
+  execution is accepted until a future deduplication/idempotency specification.
 - Cancellation requires a separately designed command and race policy.
 
 ## 3. Context and Scope
@@ -114,8 +113,8 @@ flowchart LR
 ### 3.2 System boundary
 
 Inside the solution boundary are topic/schema contracts, shared producer library or
-optional stateless submission API, worker runtime, handler registry, Kafka-backed inbox
-state, rate limiter, backpressure controller, offset coordinator, transactional output
+optional stateless submission API, worker runtime, handler registry, rate limiter,
+backpressure controller, offset coordinator, transactional output
 publisher, metrics, health, and DLQ tooling.
 
 Managed Kafka, Schema Registry, identity/secret systems, business dependencies, visibility
@@ -127,7 +126,7 @@ configuration remain architecture contracts.
 | Interface | Direction | Consistency | Purpose |
 | --- | --- | --- | --- |
 | `job-requests.v1` | Inbound | Broker-acknowledged, at least once | Immediately eligible commands. |
-| Business handler | Outbound | Handler-specific | Perform idempotent work. |
+| Business handler | Outbound | At least once | Perform work that may be repeated after ambiguity. |
 | `job-results.v1` | Outbound | Transactional with source offset | Immutable attempt/result evidence. |
 | `job-lifecycle-edr.v1` | Outbound | Transactional with source offset | Visibility lifecycle evidence. |
 | `job-requests-dlq.v1` | Outbound | Transactional with source offset | Quarantined permanent/exhausted work. |
@@ -141,9 +140,8 @@ configuration remain architecture contracts.
 3. A group assigns each partition to one worker pod.
 4. The pod polls bounded batches and dispatches only when queue, concurrency, TPS, and
    backpressure gates permit.
-5. A keyed execution gate permits at most one active job per `ownerId`; Kafka-backed
-   inbox/result state identifies completed or conflicting duplicates.
-6. The handler performs its side effect through a stable operation idempotency key.
+5. A keyed execution gate permits at most one active job per `ownerId` in a pod.
+6. The handler performs its side effect with documented at-least-once semantics.
 7. The worker transactionally writes result/lifecycle/retry/DLQ records and source offsets.
 8. Publication failure pauses affected work while heartbeat polls preserve membership.
 
@@ -165,7 +163,6 @@ flowchart LR
     results[["Kafka: job-results.v1"]]
     lifecycle[["Kafka: job-lifecycle-edr.v1"]]
     dlq[["Kafka: job-requests-dlq.v1"]]
-    state[["Kafka: compacted inbox changelog"]]
     visibility["Container: Existing projection/visibility"]
 
     client -->|"Direct publish"| work
@@ -176,7 +173,6 @@ flowchart LR
     workers -->|"Transactional writes"| results
     workers -->|"Transactional writes"| lifecycle
     workers -->|"Transactional failure handoff"| dlq
-    workers <-->|"Restore/update idempotency"| state
     lifecycle --> visibility
     results --> visibility
 ```
@@ -189,7 +185,6 @@ flowchart LR
     capacity["Capacity gate"]
     limiter["Token-bucket limiter"]
     ownerGate["Per-owner execution gate"]
-    inbox["Kafka-backed inbox"]
     registry["Handler registry"]
     handler["Job handler"]
     outcome["Outcome classifier"]
@@ -198,7 +193,7 @@ flowchart LR
     pressure["Backpressure controller"]
     health["Health and telemetry"]
 
-    consumer --> capacity --> limiter --> ownerGate --> inbox --> registry --> handler --> outcome
+    consumer --> capacity --> limiter --> ownerGate --> registry --> handler --> outcome
     outcome --> publisher --> offsets
     publisher -->|"Failure/success signal"| pressure
     pressure -->|"Pause/resume assignments"| consumer
@@ -222,10 +217,10 @@ sequenceDiagram
     C->>K: Produce keyed request
     K-->>C: Broker acknowledgement
     W->>K: Poll request
-    W->>W: Acquire TPS token and check inbox
-    W->>B: Execute with idempotency key
+    W->>W: Acquire TPS token and owner gate
+    W->>B: Execute handler
     B-->>W: Success
-    W->>K: Begin transaction for result, lifecycle, and inbox
+    W->>K: Begin transaction for result and lifecycle
     W->>K: Send source offset and commit transaction
     K-->>W: Transaction committed
 ```
@@ -251,8 +246,7 @@ sequenceDiagram
 The worker classifies the record, begins a Kafka transaction, publishes terminal result,
 lifecycle, and DLQ envelopes, adds the source offset, and commits. Any failure aborts the
 transaction, leaves the source offset unchanged, and activates backpressure. A crash after
-an external side effect but before commit causes redelivery and relies on handler
-idempotency.
+an external side effect but before commit causes redelivery and may repeat that effect.
 
 ### 6.4 Rebalance and shutdown
 
@@ -263,8 +257,8 @@ redelivery. Shutdown first fails readiness, then follows the same bounded drain 
 Kafka assigns a partition to at most one consumer in the same `group.id` during stable
 operation. During reassignment, however, the former pod may still have an external call in
 flight after the new pod receives the partition. Offset ownership alone cannot cancel that
-call, so generation fencing protects Kafka writes and the shared job/operation idempotency
-key protects the external effect.
+call, so generation fencing protects Kafka writes but does not prevent a duplicate external
+effect.
 
 ```mermaid
 sequenceDiagram
@@ -273,15 +267,15 @@ sequenceDiagram
     participant B as New pod B
     participant D as Business dependency
 
-    A->>D: Execute job with operation id
+    A->>D: Execute job
     K->>A: Revoke partition
     A->>A: Stop dispatch and begin bounded drain
     K->>B: Assign partition at new generation
     B->>K: Read from last committed offset
     A-->>K: Late transaction from stale generation
     K--xA: Fence or reject stale transaction
-    B->>D: Redeliver with same operation id
-    D-->>B: Existing idempotent outcome
+    B->>D: Redeliver job
+    D-->>B: Possibly repeated outcome
     B->>K: Commit outputs and source offset transactionally
 ```
 
@@ -292,7 +286,6 @@ flowchart TB
     subgraph kafka["Kafka cluster"]
         work["Work partitions"]
         outputs["Result/lifecycle/DLQ topics"]
-        changelog["Inbox changelog"]
     end
     subgraph k8s["Kubernetes worker deployment"]
         p1["Pod 1: consumer + handlers"]
@@ -306,9 +299,6 @@ flowchart TB
     p1 --> outputs
     p2 --> outputs
     pn --> outputs
-    p1 <--> changelog
-    p2 <--> changelog
-    pn <--> changelog
 ```
 
 Maximum active parallelism is bounded by partition count. Each pod has a unique consumer
@@ -329,7 +319,7 @@ Within that group, only the current assignment generation may publish results or
 offsets. For completed offsets `100` and `102` with `101` still running, the highest safe
 commit is `101`; committing `103` is forbidden because it would skip offset `101`.
 
-### 8.2 Owner affinity and idempotency
+### 8.2 Owner affinity and duplicate semantics
 
 `ownerId` is a canonical subscriber or business-group identifier and is the serialized
 Kafka key. `ownerType` declares whether it represents `SUBSCRIBER` or `GROUP`. All producers
@@ -345,9 +335,9 @@ has no relationship to a business group owner.
 
 Partition affinity does not itself prevent concurrent dispatch inside a worker. A per-owner
 gate permits at most one active job for each `ownerId`; different owners sharing a partition
-may execute concurrently behind contiguous offset tracking. The domain idempotency key
-remains `(jobId, attempt)`. Matching duplicates converge, conflicting immutable payloads are
-rejected, and Kafka-backed state is restored before accepting work.
+may execute concurrently behind contiguous offset tracking. There is no durable
+`(jobId, attempt)` lookup in Spec 006. Redelivery or resubmission may repeat execution and
+produce duplicate results; durable deduplication and conflict handling are deferred.
 
 ### 8.3 Backpressure and rate limiting
 
@@ -365,7 +355,7 @@ audited. Schemas, payload size, quotas, encryption, and redaction are centrally 
 
 Correlation includes `jobId`, attempt, topic, partition, offset, transaction, and worker
 identity. Metrics cover lag/age, assignments, pauses, TPS waits, concurrency, transaction
-aborts, retries, DLQ, rebalances, and idempotent duplicates.
+aborts, retries, DLQ, rebalances, and repeated job/attempt observations.
 
 ## 9. Architecture Decisions
 
@@ -378,7 +368,8 @@ aborts, retries, DLQ, rebalances, and idempotent duplicates.
 | ADR-006-05 | TPS is enforced per pod with a token bucket. | Simple and locally enforceable. | Fleet TPS changes with replica count. |
 | ADR-006-06 | Required publication failure pauses partitions. | Prevents consuming work whose outcome cannot be made durable. | Lag grows visibly during outage. |
 | ADR-006-07 | Kafka transactions couple outputs and source offsets. | Avoids partial Kafka handoffs. | Unique transactional IDs and `read_committed` are required. |
-| ADR-006-08 | End-to-end semantics remain at least once. | External side effects cannot join Kafka transactions. | Handler idempotency is compulsory. |
+| ADR-006-08 | End-to-end semantics remain at least once. | External side effects cannot join Kafka transactions. | Duplicate execution is accepted and must be observable. |
+| ADR-006-09 | Durable job deduplication is deferred. | Keep Spec 006 focused on pull delivery, flow control, and offset safety. | A later spec must define storage, TTL/retention, conflicts, and external idempotency. |
 
 ## 10. Quality Requirements
 
@@ -386,18 +377,18 @@ aborts, retries, DLQ, rebalances, and idempotent duplicates.
 | --- | --- |
 | Broker acknowledges submission | Request survives client exit and is eventually assigned within retention/SLO bounds. |
 | Output Kafka write fails | No source commit; pod pauses new work and continues heartbeat polls. |
-| Pod dies after side effect | Request redelivers; stable operation key prevents duplicate logical effect. |
+| Pod dies after side effect | Request redelivers; any duplicate execution is measured and reported. |
 | Pod exceeds TPS demand | Starts remain within configured rate/burst; lag grows rather than dependency load. |
 | Permanent poison record | DLQ/result/lifecycle and source offset commit atomically. |
 | Rebalance during concurrent work | No offset advances over unfinished earlier work. |
-| Former pod completes after revocation | Its stale Kafka transaction is fenced; redelivery converges through the same external idempotency key. |
+| Former pod completes after revocation | Its stale Kafka transaction is fenced; redelivery may repeat the external effect. |
 | Two pods use different consumer groups | Validation/deployment policy detects the split fleet before both can process production work. |
 | Offsets 100 and 102 complete while 101 runs | Commit advances only to 101, never 103. |
-| New producer session resubmits | Kafka-backed domain idempotency detects the duplicate. |
+| New producer session resubmits | Both records may execute; metrics expose the repeated `(jobId, attempt)`. |
 | Two jobs for one owner are fetched together | Per-owner gate allows only one active handler for that `ownerId`. |
 | 20,000 requests arrive over ten minutes | Three baseline pods cap starts near 30/second; excess is visible as lag and later drains. |
 | One owner produces 50% of a burst | Its jobs remain serialized and skew is measurable without corrupting other partitions. |
-| One of three pods dies during a burst | Kafka reassigns partitions; duplicates converge and surviving pods retain their TPS limits. |
+| One of three pods dies during a burst | Kafka reassigns partitions; duplicates are measured and surviving pods retain their TPS limits. |
 | 20,000 requests arrive in one minute | Kafka retains intake while bounded pod queues avoid memory growth; recovery duration is measured. |
 
 ### 10.1 Capacity and chaos baseline
@@ -419,11 +410,10 @@ be evaluated if six cannot absorb realistic peak and recovery demand.
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| External side effect is not transactional with Kafka | Duplicate physical calls | Target idempotency keys, durable conditional writes, fault tests. |
+| External side effect is not transactional with Kafka | Duplicate physical calls | Accepted in Spec 006, measured in fault tests, resolved by the next spec. |
 | Direct Kafka access expands client responsibility | Schema/security/configuration drift | Shared producer SDK or stateless submission API. |
 | Large owners or too few partitions | Low throughput and head-of-line blocking | Per-owner volume tests, skew metrics, fixed reviewed partition strategy. |
 | Retry is immediate | Dependency amplification | TPS gate, attempt limit, backpressure; add timer service only by new design. |
-| Kafka-backed inbox restore is slow | Rebalance recovery delay | Bounded state, standby replicas where justified, restore metrics. |
 | Transaction misconfiguration | Duplicated/hidden outputs | Startup validation, unique IDs, `read_committed`, integration tests. |
 | No operational job table | Query/cancel behavior is eventually consistent | Result/lifecycle projections and separate cancellation contract. |
 
@@ -432,10 +422,9 @@ be evaluated if six cannot absorb realistic peak and recovery demand.
 | Term | Meaning |
 | --- | --- |
 | Safe offset | Next Kafka offset after a contiguous set whose required durable work is complete. |
-| Kafka-backed inbox | Restorable state keyed by job/attempt that prevents repeated logical execution. |
 | Backpressure | Pausing dispatch while retaining records and consumer membership. |
 | Immediate retry | A new attempt published without a scheduled delay. |
 | DLQ | Kafka topic containing permanent or exhausted failures plus source coordinates. |
-| Logical outcome | Domain result after duplicate deliveries are collapsed by idempotency. |
+| Duplicate execution | A repeated handler invocation for the same `(jobId, attempt)`, permitted by Spec 006. |
 | `ownerId` | Canonical Kafka key identifying the subscriber or business group whose jobs must not overlap. |
 | `ownerType` | Metadata declaring whether `ownerId` represents `SUBSCRIBER` or `GROUP`. |
