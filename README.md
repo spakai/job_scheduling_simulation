@@ -36,6 +36,8 @@ Production API composition and the standalone scheduler runtime are specified in
 [`specs/004-production-api-runtime`](specs/004-production-api-runtime/).
 Resource-pressure experiments and deterministic application fault injection are specified in
 [`specs/005-resource-pressure-fault-injection`](specs/005-resource-pressure-fault-injection/).
+The proposed Kafka pull-based scheduler replacement is specified in
+[`specs/006-kafka-pull-job-scheduler`](specs/006-kafka-pull-job-scheduler/).
 The arc42-aligned C4 architecture documentation is in [`architecture.md`](architecture.md).
 The latest human-readable run report is in
 [`simulation-results/summary.md`](simulation-results/summary.md).
