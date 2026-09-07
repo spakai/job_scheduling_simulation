@@ -8,7 +8,7 @@ Governing specification: [`spec.md`](spec.md)
 
 This arc42 document is the target production architecture for the Kafka pull worker. It
 supersedes the Python worker architecture in Spec 006 while retaining Spec 006 topic and
-producer contracts.
+compatible envelope fields; topic/key migration is explicit in Spec 007 section 14.
 
 ## Contents
 
@@ -29,8 +29,8 @@ producer contracts.
 
 ### 1.1 Purpose
 
-Clients publish immediately executable jobs directly to Kafka using canonical `ownerId` as
-the record key. Vert.x worker pods consume the topic, run bounded concurrent work within and across partitions,
+Clients publish immediate jobs to `subscriber-rerate` keyed by `subscriberId` or
+`group-rerate` keyed by `groupId`, with separate deployments and consumer groups. Vert.x worker pods consume the topic, run bounded concurrent work within and across partitions,
 serialize records for each owner, limit starts per pod, and commit required
 Kafka outcomes with exact source offsets.
 
@@ -42,12 +42,12 @@ lifecycle evidence, failure quarantine, completed-request ledger, and consumer o
 | Priority | Goal | Architectural response |
 | ---: | --- | --- |
 | 1 | Offset correctness | Contiguous-completion tracker and atomic prefix transactions per partition. |
-| 2 | Owner serialization | Canonical `ownerId` key and FIFO owner gates held through commit. |
+| 2 | Owner serialization | Canonical workload entity key and FIFO owner gates held through commit. |
 | 3 | Reactive responsiveness | Event-loop-confined control state and no blocking event-loop calls. |
 | 4 | Useful concurrency | Multiple owners in one assigned partition execute concurrently. |
 | 5 | Bounded load | Pod-wide token bucket, lane queues, worker executor, and pause/resume. |
-| 6 | Atomic Kafka completion | Required outputs, ledger record, and source offset use one transaction. |
-| 7 | Completed duplicate suppression | Kafka-backed partition-local ledger restored before readiness. |
+| 6 | Atomic Kafka completion | Prefix outputs and source offset commit atomically after durable completion EDR. |
+| 7 | Completed duplicate suppression | Durable EDR/state restored before readiness, independent of cache TTL. |
 | 8 | Safe ownership transfer | Assignment epochs reject late completions after revocation. |
 | 9 | Operability | Lane, event-loop, executor, transaction, lag, and ledger state are observable. |
 
@@ -66,9 +66,9 @@ lifecycle evidence, failure quarantine, completed-request ledger, and consumer o
 
 ### 2.1 Functional constraints
 
-- Requests are eligible immediately and are keyed by canonical `ownerId`.
+- Requests are immediate and keyed by the canonical entity ID for their workload topic.
 - `ownerId` represents either `subscriber:<id>` or `group:<id>` as declared by `ownerType`.
-- All production replicas use one consumer group.
+- Each workload fleet uses one consumer group per workload; subscriber/group topics and resources are isolated.
 - Each assigned partition processes bounded concurrent records for different owners.
 - Different assigned partitions may process concurrently.
 - Auto commit is disabled and fetched positions are never treated as processed offsets.
@@ -97,7 +97,7 @@ arbitrary external side effect cannot participate in that transaction. The end-t
 guarantee therefore remains at least once across ambiguous external-call failures.
 
 Completed deduplication narrows, but does not eliminate, this window. Business handlers
-must propagate `(jobId, attempt)` as an idempotency key whenever the dependency supports it.
+must propagate stable `jobId` as an idempotency key across retry generations whenever the dependency supports it.
 
 ## 3. Context and Scope
 
@@ -133,17 +133,31 @@ are migration/reference systems, not production peers after cutover.
 
 | Interface | Direction | Consistency | Purpose |
 | --- | --- | --- | --- |
-| `job-requests.v1` | Inbound | Broker-acknowledged, at least once | Immediately eligible work. |
+| `subscriber-rerate` / `group-rerate` | Inbound | Broker-acknowledged, at least once | Immediately eligible work. |
 | Business handler | Outbound | At least once | Perform the requested effect. |
 | `job-results.v1` | Outbound | Transactional with source offset | Immutable attempt outcome. |
 | `job-lifecycle-edr.v1` | Outbound | Transactional with source offset | Lifecycle evidence. |
-| `job-requests-dlq.v1` | Outbound | Transactional with source offset | Permanent/exhausted failures. |
-| `job-execution-ledger.v1` | Internal | Transactional, compacted | Completed duplicate authority. |
+| Workload-specific DLQ | Outbound | Transactional with source offset | Permanent/exhausted failures. |
+| workload-scoped execution-state topics | Internal | Transactional, compacted | Completed duplicate authority. |
 | `/health/live`, `/health/ready`, `/metrics` | Outbound | Near real time | Platform and operator status. |
+
+### 3.4 Rerating topology and capacity baseline
+
+Use `subscriber-rerate` keyed by `subscriberId` with 10 partitions and 5 subscriber pods,
+each with one work-consumer verticle and 10 shared asynchronous execution slots. Kafka
+assigns approximately two partitions per pod; partition coordinators are local state, not
+consumer verticles. Use `subscribe`, not manual work assignment. Group rerating uses its own
+topic/key, group, deployment, pool and limiter. Another group on the subscriber topic would
+receive all subscriber records and is not workload isolation.
+
+The backlog stays in Kafka. At 20,000/day and 180 seconds per job, 42 slots are the ideal
+24-hour minimum; 50 provide 24,000/day before overhead. Shorter 12/8-hour windows need at
+least 84/125 slots respectively. TPS and concurrency are separate: 5 × 2 TPS is up to 10
+starts/s, while 50 long-running slots usually constrain sustained throughput first.
 
 ## 4. Solution Strategy
 
-1. Keep Spec 006's work, result, lifecycle, retry, DLQ, and `ownerId` contracts.
+1. Keep compatible envelope fields while explicitly migrating topic/key routing to isolated rerating workloads.
 2. Replace the production Python worker with one Vert.x service per pod.
 3. Confine Kafka consumer control and mutable lane state to Vert.x contexts.
 4. Register each record in an ordered tracker identified by topic and partition.
@@ -172,8 +186,8 @@ flowchart LR
     ledger[("Kafka compacted execution ledger")]
     visibility["Container: visibility projection"]
 
-    clients -->|"ownerId-keyed records"| work
-    work -->|"one consumer group"| workers
+    clients -->|"entity-ID-keyed records"| work
+    work -->|"one consumer group per workload"| workers
     workers -->|"non-blocking or isolated call"| target
     workers -->|"transactional outputs"| outputs
     workers -->|"transactional completion"| ledger
@@ -239,13 +253,13 @@ sequenceDiagram
     participant B as Business dependency
     participant T as Transaction adapter
 
-    C->>K: Produce request keyed by ownerId
+    C->>K: Produce request keyed by workload entity ID
     K-->>C: Broker acknowledgement
     V->>L: Enqueue source record
-    L->>L: Check ledger and acquire TPS
-    L->>B: Execute with jobId and attempt idempotency key
+    L->>L: Check EDR, acquire capacity, persist ATTEMPT_STARTED, acquire TPS
+    L->>B: Execute with stable jobId idempotency key
     B-->>L: Success
-    L->>L: Mark completed and collect bounded completed prefix
+    L->>L: Persist JOB_COMPLETED then collect bounded completed prefix
     L->>T: Submit prefix outputs ledger records and safe next offset
     T->>K: Begin transaction and send records
     T->>K: Send source next offset with group metadata
@@ -345,7 +359,7 @@ the first call; its idempotency key is the only way to prevent a repeated physic
 ```mermaid
 flowchart TB
     subgraph kafka["Kafka cluster"]
-        requests["job-requests.v1 with N partitions"]
+        requests["One workload topic with N partitions"]
         results["result lifecycle and DLQ topics"]
         ledger["execution ledger with N partitions"]
     end
@@ -409,7 +423,7 @@ owner of transaction lifecycle operations. It receives immutable completion comm
 checks assignment epochs, writes all required Kafka records, sends offsets with consumer
 group metadata, and reports a Future back to the lane context.
 
-The adapter's queue is bounded. Saturation backpressures lane dispatch. Transactional IDs
+The adapter's queue is bounded. Saturation backpressures lane dispatch. Source-prefix transactional IDs
 are unique by environment, workload, and stable worker slot. The replacement for a slot
 reuses its ID during transaction initialization, fencing a stale producer from that slot.
 
@@ -417,12 +431,27 @@ reuses its ID during transaction initialization, fencing a stale producer from t
 
 Completed ledger records contain logical identity, immutable request hash, outcome
 reference, completion time, source coordinates, and expiry time. They are written in the
-same Kafka transaction as the logical result and source offset.
+short EDR transaction before source advancement. A later prefix transaction finalizes
+required outputs and offsets. Completed EDRs behind a gap survive replay.
 
 Ledger partitions mirror work partitions. Assignment restoration reads to a captured end
-offset before the lane becomes ready. Compaction bounds historical keys; an explicit
-tombstone process applies business retention. A two-hour TTL is valid only when the entire
-redelivery and support window is shorter than two hours.
+offset before the lane becomes ready. Compaction and audited tombstones follow the durable recovery/replay retention contract.
+An optional one-hour cache never replaces durable EDR state; expiry triggers durable lookup.
+
+### 8.4.1 Attempt and completion durability
+
+Confirm ATTEMPT_STARTED before each invocation and JOB_COMPLETED immediately after success,
+before advancing source offsets. The EDR event and compacted state commit together in short
+EDR-only transactions; prefix results/offsets commit later. Restore durable outcomes to
+skip business work on replay, including 103/104 behind failed 102. Started-only live leases
+require reconciliation/waiting; stale leases permit bounded recovery with idempotency, not
+an assumption the former call stopped. Cache TTL is independent of durable retention.
+
+Fence old EDR writers on partition reassignment before capturing restore targets; local
+assignment tokens alone cannot fence already-sent broker writes. Use partition-scoped EDR
+transactional IDs distinct from pod-slot prefix IDs, behind the serialized adapter, and
+prove restore/writer ordering. Never overwrite known job success with a later attempt.
+See Spec 007 section 8.2 for invocation IDs, logical retry identity and retention rules.
 
 ### 8.5 Backpressure and capacity
 
@@ -431,6 +460,21 @@ entries. Reserve client-buffer headroom and allow admitted work to close the ear
 A completed outcome behind a gap retains window capacity; handler capacity is separate. The pod TPS token bucket protects the
 business dependency. The transaction-adapter queue protects Kafka/JVM resources. Any gate
 can pause affected partitions without committing records merely because they were fetched.
+
+### 8.5.1 Adaptive rates and retry isolation
+
+Use 2/1/0.5/0 TPS healthy/degraded/severe/open targets, with configurable timeout/429/503
+thresholds, hysteresis, cooldown, bounded half-open probes and gradual recovery. Zero TPS
+is required during dependency outage; an administrative pause forbids business probes.
+Do not block for permits. Strict downstream quotas need explicit per-fleet allocation
+(e.g. 0.4 TPS × 5 pods for 2 TPS) or a shared quota service, including group/retry demand.
+
+Internal retries (initially two) reacquire TPS and slots and persist new attempt EDRs.
+Exhaustion stages a transactional retry/DLQ handoff with the contiguous source commit.
+A separately controlled retry deployment, normally allowed at zero replicas, requeues to
+the original workload topic/key with bounded generation/age and atomic retry-source commits.
+It never invokes business operations outside the workload fleet's owner gates. Quarantine
+requeue does not guarantee original ordering relative to newer owner jobs.
 
 ### 8.6 Security
 
@@ -442,8 +486,8 @@ by default.
 ### 8.7 Observability
 
 OpenTelemetry context is propagated through Future chains and worker-executor boundaries.
-Micrometer exposes Vert.x/JVM, custom lane, TPS, Kafka, transaction, ledger, and business
-adapter metrics. Cardinality is bounded: raw `jobId` and `ownerId` are trace/log fields, not
+Micrometer exposes Vert.x/JVM, custom lane, TPS/circuit, Kafka, transaction, EDR, and business
+adapter metrics, including stale attempt age, timeout/429/503 rates and business-to-EDR-to-commit latency. Cardinality is bounded: raw `jobId` and `ownerId` are trace/log fields, not
 metric labels.
 
 ## 9. Architecture Decisions
@@ -460,8 +504,11 @@ metric labels.
 | ADR-007-08 | One bounded completed prefix uses one transaction initially. | Couple every prefix output with its safe next offset. | Retain outcomes behind gaps; cross-partition batching is deferred. |
 | ADR-007-09 | Completed deduplication uses a compacted Kafka ledger plus local restored stores. | Avoids reintroducing a scheduler database or relying on ephemeral caches. | Assignment readiness waits for restore. |
 | ADR-007-10 | Dedup retention follows the recovery/replay window, not an arbitrary TTL. | A short TTL silently reopens duplicate execution. | Cleanup requires governed tombstones. |
-| ADR-007-11 | External operations receive `(jobId, attempt)` idempotency keys. | Kafka cannot atomically commit an external side effect. | Dependencies unable to honor the key retain at-least-once effects. |
+| ADR-007-11 | External operations receive stable `jobId` idempotency keys across retries. | Kafka cannot atomically commit an external side effect. | Dependencies unable to honor the key retain at-least-once effects. |
 | ADR-007-12 | Python remains a test oracle during migration only. | Enables differential validation without dual production processing. | Cutover must enforce mutually exclusive consumers. |
+| ADR-007-13 | Subscriber/group work uses separate topics and fleets. | Slow group work must not consume subscriber slots. | Explicit producer topic/key migration and independent capacity budgets. |
+| ADR-007-14 | Durable EDR completion precedes source-prefix commit. | Completed business work survives offset gaps. | Additional short transactions, recoverable outcomes and partition-writer fencing. |
+| ADR-007-15 | Retry consumers requeue to the workload fleet. | Keep business execution under its owner gates. | Separate retry deployment; original ordering across quarantine is not promised. |
 
 ## 10. Quality Requirements
 

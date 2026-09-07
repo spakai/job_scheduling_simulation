@@ -25,11 +25,29 @@ Depends on: completed Spec 006 Kafka contracts and Dockerized reference worker
 
 ## 1. Objective
 
-Deliver a Java 21/Vert.x 5 production pull-worker that preserves Spec 006's database-free
-Kafka interface while changing execution from one record per pod to bounded concurrent records within each assigned
+Deliver a Java 21/Vert.x 5 production pull-worker that preserves the database-free
+Kafka path while migrating subscriber/group topic routing while changing execution from one record per pod to bounded concurrent records within each assigned
 partition, preserving same-owner FIFO and keeping partition counts low. The implementation must keep event loops non-blocking, serialize Kafka
 transactions, provide exact manual-offset semantics, add completed-request deduplication,
 and run as a hardened Docker container.
+
+### Alignment with offline rerating notes
+
+The governing details are Spec 007 sections 3.1, 7.1–7.2, 8.2, and 14. Deliver:
+
+- Subscriber baseline: 10 partitions, 5 pods, 10 concurrent worker slots per pod; one
+  dedicated work-consumer verticle per pod using subscription/group assignment.
+- Group isolation: separate topic/key, consumer group, deployment, worker pool and TPS budget.
+- Durable EDR transactions: ATTEMPT_STARTED before invocation, JOB_COMPLETED before source
+  commit, materialized state restoration and old-writer fencing, stale-lease recovery.
+- Two initial internal retries with fresh attempt IDs and reacquired TPS/concurrency;
+  transactional quarantine and a normally-zero separate retry requeue deployment.
+- Adaptive per-pod 2/1/0.5/0 TPS, configurable thresholds and gradual recovery; concurrency
+  admission remains independent. Rebudget fleet allocations when pod count changes.
+
+The 20,000/day baseline assumes 60–180 second work. At 180 seconds, ideal minimum slots
+are 42/84/125 for 24/12/8-hour windows; 50 slots yield 24,000/day before overhead. Load tests
+must include EDR and prefix-commit latency, owner skew, outages and retry demand.
 
 ## 2. Baseline and Gaps
 
@@ -56,7 +74,7 @@ The migration gaps are:
 
 ## 3. Delivery Principles
 
-- Freeze Kafka contracts before replacing the runtime.
+- Freeze compatible envelope fields and approve explicit topic/key migration fixtures.
 - Keep one mutable-state owner for consumer control and each partition lane.
 - Compose `Future` chains; do not block event loops with `await`, sleeps, Kafka transaction
   calls, or synchronous business clients.
@@ -65,7 +83,7 @@ The migration gaps are:
 - Serialize all transaction lifecycle calls in one bounded adapter.
 - Restore durable dedup state before lane readiness.
 - Make queues, executors, transactions, handlers, restores, and shutdown bounded.
-- Compare Vert.x outcomes against the Python reference before production cutover.
+- Compare logical outcomes against Python using topic/key translation fixtures before cutover.
 - Never run Python and Vert.x production consumers concurrently.
 
 ## 4. Target Repository Shape
@@ -109,9 +127,15 @@ vertx-pull-worker/
       LedgerStore.java
       LedgerRestorer.java
       LedgerCleanup.java
+      AttemptEdrWriter.java
+      AttemptLeaseRecovery.java
+    retry/
+      InternalRetryPolicy.java
+      RetryRequeueVerticle.java
     resilience/
       BackpressureController.java
       RecoveryProbe.java
+      AdaptiveRateController.java
     telemetry/
       HealthRoutes.java
       Metrics.java
@@ -124,7 +148,8 @@ vertx-pull-worker/
     integration/
     chaos/
 infra/kafka/schemas/
-  job-execution-ledger-v1.json
+  rerating-attempt-edr-v1.json
+  rerating-execution-state-v1.json
 compose.yaml
 docs/
   spec-007-runbook.md
@@ -146,7 +171,7 @@ Phase 1  Vert.x bootstrap, configuration, health, and Docker image
 Phase 2  Consumer controller, bounded routing, and partition lanes
 Phase 3  Handlers, worker isolation, TPS, and backpressure
 Phase 4  Transaction adapter and exact source offsets
-Phase 5  Kafka-backed completed ledger and restoration
+Phase 5  Durable attempt/completion EDR, writer fencing, and restoration
 Phase 6  Rebalance, shutdown, observability, and security hardening
 Phase 7  Performance, chaos, migration, rollback, and retirement
 ```
@@ -160,7 +185,8 @@ not spread native-client `unwrap()` calls while those ownership rules are unreso
 
 Tasks:
 
-1. Freeze Spec 006 topic names, schema versions, owner normalization, retry, and DLQ fields.
+1. Define isolated subscriber/group work, retry, DLQ, EDR/state topics; freeze compatible
+   envelope fields and document new entity-ID wire keys and legacy ownerId translation.
 2. Select and pin Java 21, the approved Vert.x 5 BOM, Kafka client, testcontainers, JUnit 5,
    logging, OpenTelemetry, and Micrometer versions.
 3. Create a Maven module with compiler, test, coverage, dependency convergence, formatting,
@@ -172,12 +198,14 @@ Tasks:
 7. Prove a transaction containing result plus exact source offset is atomically visible to
    `read_committed` consumers.
 8. Decide embedded ledger storage implementation and state-directory lifecycle.
-9. Add architecture fitness tests forbidding no-argument work commits and general native
+9. Prove partition-scoped EDR writer fencing before restoration; old pods cannot overwrite
+   completion with a late attempt event. Keep EDR-only and source-prefix transactions separate.
+10. Add architecture fitness tests forbidding no-argument work commits and general native
    consumer/producer access outside approved adapters.
 
 Exit criteria:
 
-- One executable spike commits one exact source offset with one output transaction.
+- One executable spike commits one exact source offset with one output transaction, plus an independently durable EDR write with no offset advance.
 - A blocked transaction call does not delay the Vert.x event loop or health endpoint.
 - Dependency and license/security scans pass.
 - Schema fixtures round-trip identically between Python and Java.
@@ -215,7 +243,7 @@ Tasks:
    within the same partition while earlier records remain unfinished.
 7. Enforce partition/pod handler limits and record/byte bounds over queued, running, completed,
    and committing records; reserve fetch headroom and capacity for the earliest gap to finish.
-8. Validate record key equals normalized `ownerId`; quarantine mismatch after Phase 4 lands.
+8. Validate topic, entity-ID key and owner metadata agree; quarantine mismatch after Phase 4 lands.
 9. Add owner-overlap assertion metrics and group-assignment telemetry.
 
 Exit criteria:
@@ -229,7 +257,7 @@ Exit criteria:
 Tasks:
 
 1. Define `Handler` as a non-blocking `Future<Outcome>` contract.
-2. Port Spec 006 reference handlers and outcome taxonomy.
+2. Port reference handlers/outcomes and add 60–180 second rerating load fixtures.
 3. Add a named bounded `WorkerExecutor` adapter for blocking handlers with `ordered=false`.
 4. Add separate handler permits and uncommitted-window accounting; completion releases only handler capacity.
 5. Port the virtual-clock-testable per-pod token bucket using Vert.x timers in production.
@@ -238,6 +266,10 @@ Tasks:
 8. Prevent new starts during required-output/dependency failure while keeping consumer and
    health contexts responsive.
 9. Add timeouts, cancellation signals, and late-completion classification.
+10. Implement adaptive 2/1/0.5/0 TPS, threshold windows, hysteresis, half-open probe budgets,
+    and gradual recovery; use fractional rates and nonblocking admission.
+11. Implement bounded internal retry with timer backoff, reacquired slots/permits, and
+    fresh durable attempt records; retain owner ordering through internal retry.
 
 Exit criteria:
 
@@ -257,15 +289,16 @@ Tasks:
    consumer access.
 5. Revalidate assignment epoch before transaction begin and immediately before commit.
 6. Wire success result/lifecycle plus source offset.
-7. Wire retry request/lifecycle plus source offset while preserving `ownerId` key.
-8. Wire terminal result/lifecycle/DLQ plus source offset.
+7. Wire retry request/lifecycle plus source offset while preserving the original workload entity key.
+8. Wire terminal result/lifecycle/DLQ plus source offset and separately deployed retry
+   requeue consumer, with atomic requeue/offset commits and generation/age bounds.
 9. Retain the confirmed watermark on failure; resolve ambiguous broker commits and restore ledger/offset
    state before fenced replay. Reject callbacks from old epochs/execution tokens.
 10. Batch all outputs for a contiguous completed prefix, split by record/byte/time limits, and
    permit only one outstanding prefix per partition; never wait for handlers inside a transaction.
 11. Add failpoints around every send, group-offset operation, commit, abort, and callback.
     Include `VTX-OFF-05`: barrier-controlled failed Future and execution-verticle undeployment
-    at 102, retained completions at 103/104, committed next offset 102, and both resolution
+    at 102, durable EDR completions at 103/104, committed next offset 102, and both resolution
     and pod-restart replay branches. Implement tracker unit and real-Kafka integration tests.
 12. Add static/fitness checks that prohibit no-argument work commit.
 
@@ -280,24 +313,26 @@ Exit criteria:
 
 Tasks:
 
-1. Create `job-execution-ledger.v1` with the work topic's partition count, compaction,
+1. Create workload-scoped EDR and compacted execution-state topics mirroring work partitions, with
    retention, replication, minimum-ISR, schema, and ACLs.
 2. Define logical identity, immutable request hash, outcome reference, expiry, and source
    coordinates.
 3. Implement a partitioned embedded store and crash-safe local state directory handling.
 4. Restore each assigned ledger partition to a captured end offset before lane readiness.
-5. Add the completed ledger record to success/terminal transactions.
-6. Suppress matching completed duplicates without invoking the handler; recheck the ledger after
-   owner-gate acquisition and update local state only on confirmed prefix commit.
+5. Implement durable ATTEMPT_STARTED before each invocation and JOB_COMPLETED before
+   source advancement; preserve recoverable outcomes and successful job identity across retries.
+6. Suppress completed business work from durable EDR state; recheck after owner-gate
+   acquisition and reconstruct pending prefix outputs. Update EDR state on confirmed EDR writes.
 7. DLQ conflicting duplicates detected within the partition-local authority.
 8. Implement audited expiry/tombstone production and local deletion.
 9. Validate that retention exceeds maximum outage, redelivery, retry, replay, and support
-   windows; document why two hours is accepted or rejected for each environment.
-10. Add ledger restore, compaction, tombstone, corrupted-local-state, and disk-pressure tests.
+   windows; verify the optional one-hour cache TTL is independent of durable retention.
+10. Add restore/compaction/tombstone/state-loss tests plus live/stale attempt leases,
+    one-hour cache expiry, and partition EDR-writer fencing across reassignment.
 
 Exit criteria:
 
-- `VTX-DEDUP-01/02/03/04` and `VTX-TTL-01` pass.
+- `VTX-DEDUP-01/02/03/04`, `VTX-TTL-01`, `VTX-EDR-01/02/03`, and `VTX-CACHE-01` pass.
 - Pod replacement restores completed identities before processing work.
 - A pod-local cache loss alone cannot cause a completed duplicate execution.
 - External-effect ambiguity remains documented and measured.
@@ -341,10 +376,11 @@ Tasks:
    and hot-owner traffic; hold partition count fixed while measuring throughput and CPU/memory.
 6. Run hot-owner, output outage, broker loss, long blocking handler, pod kill, rebalance
    storm, ledger restore, corrupt state, and state-disk pressure chaos.
-7. Establish SLO evidence and choose initial pod/resource/partition/TPS configuration.
+7. Prove the initial 10-partition/5-pod/10-slot subscriber configuration at 20,000/day
+   with 60–180 second jobs; measure isolated group load and total dependency quota allocation.
 8. Rehearse production cutover and rollback with mutually exclusive runtime checks.
-9. Stop Python consumers, capture offsets, start Vert.x consumers with the same group, and
-   observe the rollback window.
+9. Quiesce producers and drain Python/legacy work; switch topic/key routing, start isolated
+   workload fleets after EDR restoration, and observe the rollback window.
 10. Retire Python pull-worker deployment definitions after approval while retaining the
    simulator and test oracle.
 
@@ -394,19 +430,12 @@ recovery duration. Credentials and governed payload data are redacted.
 The migration unit is the worker consumer group. Shadow comparison uses a separate isolated
 topic or non-side-effecting handler; it must not call production business dependencies.
 
-Production cutover:
-
-1. fail Python readiness and stop its dispatch;
-2. wait for transactions to commit/abort and instances to leave the group;
-3. record group assignments and committed offsets;
-4. start Vert.x pods with the production group at controlled TPS;
-5. wait for ledger restoration and readiness;
-6. verify offsets continue from the captured positions; and
-7. observe outcomes, duplicates, errors, lag, and event-loop health.
-
-Rollback performs the reverse order. Vert.x must fully stop dispatch and leave the group
-before Python starts. Offset rewind is not an automatic rollback because it may repeat an
-external effect.
+Production cutover follows Spec 007 section 14. Quiesce legacy producers, drain the legacy
+work topic and Python group, then switch producer topic/key routing and start isolated
+subscriber/group fleets after EDR restoration. Preserve logical identities; never map an
+old topic's numerical offsets onto a new topic. Rehearse rollback with explicit new-backlog
+handling, EDR-aware suppression and producer routing restoration before starting Python.
+No overlapping old/new business execution is allowed during migration.
 
 ## 10. Traceability
 
@@ -417,12 +446,15 @@ external effect.
 | Cross-partition concurrency | 2 | Multi-lane overlap evidence |
 | Non-blocking event loops | 0, 3, 6 | `VTX-BLOCK-01` and delay metrics |
 | TPS/backpressure | 3 | Rate and outage evidence |
-| Exact manual offsets | 4 | `VTX-OFF-01/02/03/04/05`, `VTX-WINDOW-01` |
+| Exact manual offsets | 4 | `VTX-OFF-01/02/03/04/05`, `VTX-POS-01`, `VTX-WINDOW-01` |
 | Atomic Kafka completion | 4 | `VTX-TX-01/02/03` |
 | Rebalance fencing | 4, 6 | `VTX-REB-01` |
 | Completed deduplication | 5 | `VTX-DEDUP-01/02/03/04` |
 | Retention/expiry | 5 | `VTX-TTL-01` |
 | 20,000/100,000 capacity | 7 | `VTX-CAP-01/02` |
+| Durable EDR/lease/cache recovery | 0, 5–6 | `VTX-EDR-01/02/03`, `VTX-CACHE-01` |
+| Internal retry and separate requeue | 3–4, 7 | `VTX-RETRY-01/02` |
+| Adaptive TPS and workload isolation | 1, 3, 7 | `VTX-RATE-01`, `VTX-ISO-01` |
 | Safe runtime replacement | 7 | Cutover and rollback evidence |
 
 ## 11. Review Gates
@@ -457,14 +489,14 @@ external effect.
 Implementation is complete when:
 
 1. a pinned Java 21/Vert.x 5 Maven service and hardened image exist;
-2. all Spec 006 Kafka client contracts remain compatible;
+2. compatible envelope fields and explicit subscriber/group topic/key migration are verified;
 3. one consumer controller per pod and concurrent coordinator with completion tracker per partition exist;
 4. different owners overlap within and across partitions while same-owner records remain FIFO;
 5. event loops remain non-blocking under normal, failure, and shutdown paths;
 6. only bounded contiguous completed prefixes and their required outputs commit atomically;
 7. per-pod TPS, bounded capacity, and pause/resume backpressure are enforced;
 8. rebalance epochs fence late completions and shutdown is bounded;
-9. completed duplicates are suppressed by restored Kafka-backed state within retention;
+9. durable EDRs govern attempt recovery and completion deduplication independently of cache TTL;
 10. the external-effect duplicate limitation is tested and documented;
 11. health, metrics, logs, traces, alerts, and runbooks are production-ready;
 12. all unit, integration, chaos, Docker, 20,000, and 100,000 tests pass; and
