@@ -26,8 +26,8 @@ Depends on: completed Spec 006 Kafka contracts and Dockerized reference worker
 ## 1. Objective
 
 Deliver a Java 21/Vert.x 5 production pull-worker that preserves Spec 006's database-free
-Kafka interface while changing execution from one record per pod to one record per assigned
-partition. The implementation must keep event loops non-blocking, serialize Kafka
+Kafka interface while changing execution from one record per pod to bounded concurrent records within each assigned
+partition, preserving same-owner FIFO and keeping partition counts low. The implementation must keep event loops non-blocking, serialize Kafka
 transactions, provide exact manual-offset semantics, add completed-request deduplication,
 and run as a hardened Docker container.
 
@@ -48,7 +48,7 @@ The migration gaps are:
 | --- | --- |
 | No Java/Vert.x module | Target microservice cannot be built or deployed. |
 | Python worker is globally sequential | A pod underuses multiple assigned partitions. |
-| No explicit partition-lane runtime | Per-partition sequencing is documented but not implemented. |
+| No explicit partition-lane runtime | Concurrent dispatch, owner gates, and contiguous-completion tracking are missing. |
 | Vert.x producer lacks high-level consumed-offset transaction API | Native Kafka adapter is required and must not block event loops. |
 | No completed-request ledger | Redelivery after completion may invoke the handler again. |
 | No Vert.x event-loop/executor evidence | Responsiveness under blocking work is unproven. |
@@ -60,7 +60,7 @@ The migration gaps are:
 - Keep one mutable-state owner for consumer control and each partition lane.
 - Compose `Future` chains; do not block event loops with `await`, sleeps, Kafka transaction
   calls, or synchronous business clients.
-- Obtain concurrency across partitions, not within a partition.
+- Obtain concurrency within and across partitions, with explicit pod/partition limits and same-owner FIFO gates.
 - Use exact next-offset maps; never commit consumer fetch position implicitly.
 - Serialize all transaction lifecycle calls in one bounded adapter.
 - Restore durable dedup state before lane readiness.
@@ -95,6 +95,9 @@ vertx-pull-worker/
       PartitionLane.java
       LaneRegistry.java
       LaneState.java
+      ContiguousCompletionTracker.java
+      OwnerGate.java
+      TrackedRecord.java
     execution/
       Handler.java
       HandlerRegistry.java
@@ -199,7 +202,7 @@ Exit criteria:
 - Health/metrics remain responsive under a deliberately occupied worker executor.
 - Invalid `enable.auto.commit`, group, topic, partition, or timing configuration fails fast.
 
-### Phase 2 — Consumer and serial partition lanes
+### Phase 2 — Concurrent partition lanes and completion tracking
 
 Tasks:
 
@@ -207,16 +210,17 @@ Tasks:
 2. Implement assignment epochs and a lane registry keyed by topic/partition.
 3. Route fetched records into bounded per-partition queues.
 4. Pause at high watermark and resume at low watermark, allowing for client-buffered records.
-5. Implement lane state transitions and a one-record asynchronous Future chain.
-6. Enforce that the next record in a partition cannot start before the current completion
-   boundary succeeds.
-7. Permit different partition lanes to dispatch concurrently within pod capacity.
+5. Implement separate lane and record states, an ordered uncommitted tracker, and epoch/token-checked callbacks.
+6. Enforce same-owner FIFO gates held through confirmed commit; fairly dispatch other owners
+   within the same partition while earlier records remain unfinished.
+7. Enforce partition/pod handler limits and record/byte bounds over queued, running, completed,
+   and committing records; reserve fetch headroom and capacity for the earliest gap to finish.
 8. Validate record key equals normalized `ownerId`; quarantine mismatch after Phase 4 lands.
 9. Add owner-overlap assertion metrics and group-assignment telemetry.
 
 Exit criteria:
 
-- `VTX-LANE-01`, `VTX-LANE-02`, and `VTX-OFF-01` pass against real Kafka.
+- `VTX-LANE-01/02`, `VTX-OFF-01/02/03`, and `VTX-WINDOW-01` pass against real Kafka.
 - Queue size never exceeds its declared buffer allowance during pause races.
 - No event loop performs blocking polling or handler work.
 
@@ -227,7 +231,7 @@ Tasks:
 1. Define `Handler` as a non-blocking `Future<Outcome>` contract.
 2. Port Spec 006 reference handlers and outcome taxonomy.
 3. Add a named bounded `WorkerExecutor` adapter for blocking handlers with `ordered=false`.
-4. Add capacity acquisition/release around each execution.
+4. Add separate handler permits and uncommitted-window accounting; completion releases only handler capacity.
 5. Port the virtual-clock-testable per-pod token bucket using Vert.x timers in production.
 6. Implement zero-TPS administrative pause.
 7. Implement `RUNNING`, `PAUSED`, and `PROBING` with partition and pod scopes.
@@ -246,7 +250,7 @@ Exit criteria:
 Tasks:
 
 1. Implement immutable `TransactionCommand` with assignment epoch, required records, and
-   exact source next offset.
+   a bounded contiguous-prefix snapshot and exact safe next offset.
 2. Create one bounded single-thread transaction adapter per pod.
 3. Implement initialize, begin, send, `sendOffsetsToTransaction`, commit, abort, and close.
 4. Obtain consumer-group metadata through one reviewed adapter path without unsafe native
@@ -255,14 +259,20 @@ Tasks:
 6. Wire success result/lifecycle plus source offset.
 7. Wire retry request/lifecycle plus source offset while preserving `ownerId` key.
 8. Wire terminal result/lifecycle/DLQ plus source offset.
-9. Pause and retain source offset after transaction failure or ambiguity.
-10. Add failpoints around every send, group-offset operation, commit, abort, and callback.
-11. Add static/fitness checks that prohibit no-argument work commit.
+9. Retain the confirmed watermark on failure; resolve ambiguous broker commits and restore ledger/offset
+   state before fenced replay. Reject callbacks from old epochs/execution tokens.
+10. Batch all outputs for a contiguous completed prefix, split by record/byte/time limits, and
+   permit only one outstanding prefix per partition; never wait for handlers inside a transaction.
+11. Add failpoints around every send, group-offset operation, commit, abort, and callback.
+    Include `VTX-OFF-05`: barrier-controlled failed Future and execution-verticle undeployment
+    at 102, retained completions at 103/104, committed next offset 102, and both resolution
+    and pod-restart replay branches. Implement tracker unit and real-Kafka integration tests.
+12. Add static/fitness checks that prohibit no-argument work commit.
 
 Exit criteria:
 
-- `VTX-TX-01` and `VTX-TX-02` pass with `read_committed` evidence.
-- Fetching multiple records can never advance over the lane's current record.
+- `VTX-TX-01/02/03` and `VTX-OFF-01/02/03/04/05` pass with `read_committed` evidence.
+- Out-of-order completion never advances past the earliest unfinished delivered record; Kafka offset gaps do not stall the tracker.
 - Concurrent lane completions never create overlapping producer transactions.
 - Stale assignment epochs cannot commit.
 
@@ -277,7 +287,8 @@ Tasks:
 3. Implement a partitioned embedded store and crash-safe local state directory handling.
 4. Restore each assigned ledger partition to a captured end offset before lane readiness.
 5. Add the completed ledger record to success/terminal transactions.
-6. Suppress matching completed duplicates without invoking the handler.
+6. Suppress matching completed duplicates without invoking the handler; recheck the ledger after
+   owner-gate acquisition and update local state only on confirmed prefix commit.
 7. DLQ conflicting duplicates detected within the partition-local authority.
 8. Implement audited expiry/tombstone production and local deletion.
 9. Validate that retention exceeds maximum outage, redelivery, retry, replay, and support
@@ -286,7 +297,7 @@ Tasks:
 
 Exit criteria:
 
-- `VTX-DEDUP-01` through `VTX-TTL-01` pass.
+- `VTX-DEDUP-01/02/03/04` and `VTX-TTL-01` pass.
 - Pod replacement restores completed identities before processing work.
 - A pod-local cache loss alone cannot cause a completed duplicate execution.
 - External-effect ambiguity remains documented and measured.
@@ -296,7 +307,8 @@ Exit criteria:
 Tasks:
 
 1. Mark epochs revoked before draining and reject all stale completion commands.
-2. Implement bounded per-partition drain and abandon unfinished work without source commit.
+2. Resolve/abort submitted transactions on revocation; reject new stale transactions and drain/cancel
+   handlers. For graceful shutdown while still assigned, commit only completed prefixes before deadline.
 3. Implement readiness-first graceful shutdown within Kubernetes termination grace.
 4. Add Micrometer metrics for Vert.x/JVM, lanes, queues, TPS, transactions, lag, restores,
    duplicates, and drain.
@@ -324,8 +336,9 @@ Tasks:
    compare logical outcomes, offsets, retries, DLQs, and owner ordering.
 2. Run 20,000/day plus one-hour, ten-minute, and one-minute compressed profiles.
 3. Run 100,000/day plus agreed peak/recovery profiles.
-4. Benchmark one-record transaction throughput and transaction queue saturation.
-5. Test two, six, and twelve partition lanes per pod within CPU/memory limits.
+4. Benchmark bounded contiguous-prefix transaction throughput, gap age, and transaction saturation.
+5. Test one and two partitions per pod with concurrency 1, 2, 4, 8, and 16, using distinct-owner
+   and hot-owner traffic; hold partition count fixed while measuring throughput and CPU/memory.
 6. Run hot-owner, output outage, broker loss, long blocking handler, pod kill, rebalance
    storm, ledger restore, corrupt state, and state-disk pressure chaos.
 7. Establish SLO evidence and choose initial pod/resource/partition/TPS configuration.
@@ -347,8 +360,8 @@ Exit criteria:
 | Concern | Unit | Real-Kafka integration | Chaos/load |
 | --- | --- | --- | --- |
 | Contracts | Java codecs and Python parity | Schema Registry compatibility | Rolling-version fixtures |
-| Lanes | State transitions and serial Future chain | Multi-partition concurrency | Hot owner and slow partition |
-| Offsets | Exact `offset + 1` command | Fetch-four/commit-one proof | Crash at every boundary |
+| Lanes | Record/lane states and owner gates | Within/across-partition concurrency | Hot owner and slow partition |
+| Offsets | Contiguous-prefix tracker and sparse offsets | 100–105 gap and atomic-prefix proof | Crash at every boundary |
 | Transactions | Adapter queue and state machine | `read_committed` atomicity | Broker loss, timeout, fencing |
 | Vert.x threading | Context assertions | Responsive health during work | Blocked handler and saturated pool |
 | TPS | Deterministic token bucket | Starts per pod | Burst and replica scale |
@@ -357,7 +370,7 @@ Exit criteria:
 | Dedup | Identity/hash/expiry | Ledger restore and suppression | State loss, compaction, disk pressure |
 | Docker | Config and lifecycle | Two worker containers | Resource limits and termination |
 | Migration | Parity comparator | Shadow isolated group | Cutover/rollback rehearsal |
-| Capacity | Queue and limiter math | 20,000 and 100,000 profiles | Hot owner, recovery, partition expansion |
+| Capacity | Queue and limiter math | 20,000 and 100,000 profiles | Hot owner, gap/window saturation, fixed-partition concurrency |
 
 ## 8. CI and Evidence
 
@@ -400,14 +413,14 @@ external effect.
 | Specification concern | Phase | Primary proof |
 | --- | ---: | --- |
 | Java 21/Vert.x/Docker runtime | 0–1 | Build, image, health, and security tests |
-| Serial per-partition execution | 2 | `VTX-LANE-01/02` |
+| Concurrent per-partition execution with owner FIFO | 2 | `VTX-LANE-01/02` |
 | Cross-partition concurrency | 2 | Multi-lane overlap evidence |
 | Non-blocking event loops | 0, 3, 6 | `VTX-BLOCK-01` and delay metrics |
 | TPS/backpressure | 3 | Rate and outage evidence |
-| Exact manual offsets | 4 | `VTX-OFF-01` |
-| Atomic Kafka completion | 4 | `VTX-TX-01/02` |
+| Exact manual offsets | 4 | `VTX-OFF-01/02/03/04/05`, `VTX-WINDOW-01` |
+| Atomic Kafka completion | 4 | `VTX-TX-01/02/03` |
 | Rebalance fencing | 4, 6 | `VTX-REB-01` |
-| Completed deduplication | 5 | `VTX-DEDUP-01/02/03` |
+| Completed deduplication | 5 | `VTX-DEDUP-01/02/03/04` |
 | Retention/expiry | 5 | `VTX-TTL-01` |
 | 20,000/100,000 capacity | 7 | `VTX-CAP-01/02` |
 | Safe runtime replacement | 7 | Cutover and rollback evidence |
@@ -445,10 +458,10 @@ Implementation is complete when:
 
 1. a pinned Java 21/Vert.x 5 Maven service and hardened image exist;
 2. all Spec 006 Kafka client contracts remain compatible;
-3. one consumer controller and serial lane per assigned partition are implemented;
-4. different partitions execute concurrently and same-partition records never overlap;
+3. one consumer controller per pod and concurrent coordinator with completion tracker per partition exist;
+4. different owners overlap within and across partitions while same-owner records remain FIFO;
 5. event loops remain non-blocking under normal, failure, and shutdown paths;
-6. exact source offsets and required records use serialized Kafka transactions;
+6. only bounded contiguous completed prefixes and their required outputs commit atomically;
 7. per-pod TPS, bounded capacity, and pause/resume backpressure are enforced;
 8. rebalance epochs fence late completions and shutdown is bounded;
 9. completed duplicates are suppressed by restored Kafka-backed state within retention;

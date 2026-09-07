@@ -34,10 +34,11 @@ Implementation plan: [`plan.md`](plan.md)
 ## 1. Purpose
 
 Replace the Spec 006 Python pull worker with a Java 21, Vert.x 5 microservice while
-preserving its Kafka contracts and delivery guarantees. The new worker processes one
-record at a time in each Kafka partition and processes different assigned partitions
-concurrently. This is the default design because it preserves Kafka ordering and makes
-manual offset advancement unambiguous without restricting a pod to one job globally.
+preserving its Kafka contracts and delivery guarantees. The new worker processes bounded
+concurrent records within each assigned Kafka partition as well as across partitions. Keep partition counts low: handler concurrency is configured independently of
+partition count. Preserve same-owner serialization, but allow different owners in the same
+partition to complete out of order. A per-partition contiguous-completion tracker controls
+manual offset advancement.
 
 The service remains a pull worker, not a scheduler database. Clients continue to publish
 immediately eligible requests directly to `job-requests.v1`, keyed by canonical `ownerId`.
@@ -54,8 +55,9 @@ This specification covers:
 - a Dockerized Vert.x pull-worker microservice;
 - Java 21 and a supported, pinned Vert.x 5 release managed through the Vert.x BOM;
 - one Vert.x Kafka consumer control plane per pod;
-- one serial asynchronous execution lane per assigned Kafka partition;
-- concurrency across partitions, bounded by assigned partitions and pod capacity;
+- one concurrent asynchronous coordinator (partition lane) per assigned partition;
+- concurrency within and across partitions, bounded by partition and pod capacity;
+- per-owner FIFO gates and a contiguous-completion tracker per partition;
 - non-blocking handlers and isolated execution for unavoidable blocking handlers;
 - explicit offset maps and transactional Kafka output/offset completion;
 - partition pause/resume backpressure and bounded local queues;
@@ -78,7 +80,7 @@ during migration. They are not the target production pull runtime after Spec 007
                          +-----------------+-----------------+
                          |                 |                 |
                   partition 0 lane  partition 2 lane  partition 5 lane
-                    one at a time     one at a time     one at a time
+                    bounded overlap   bounded overlap   bounded overlap
                          +-----------------+-----------------+
                                            |
                                   pod TPS + capacity gate
@@ -91,9 +93,10 @@ during migration. They are not the target production pull runtime after Spec 007
 ```
 
 Each pod owns exactly one Kafka consumer instance for the worker group. It may own several
-partitions. Each assigned partition has one lane, and each lane has at most one active job.
-A pod owning three partitions may therefore execute up to three jobs concurrently, subject
-to its worker-pool, queue, and TPS limits.
+partitions. Each assigned partition has one lane coordinating multiple active jobs. With `P` assigned
+partitions, concurrency is at most `min(maxInFlightPerPod, P * maxInFlightPerPartition)`,
+also limited by runnable distinct owners, executor capacity, and TPS. For example, one
+partition with eight distinct owners can run eight handlers when both limits permit it.
 
 All replicas use the same `group.id`. Pods beyond the work-topic partition count are idle.
 No scheduler database, due-job query, database claim, or scheduler outbox is introduced.
@@ -108,8 +111,8 @@ must not add locks as a substitute for preserving context ownership.
 
 No handler may block an event-loop thread. Preferred business integrations use Vert.x
 non-blocking clients and return `Future<Outcome>`. Unavoidable blocking work runs through a
-named, bounded `WorkerExecutor` with `ordered=false`; the partition lane already supplies
-ordering. Using `ordered=true` on one shared Vert.x context is prohibited because it can
+named, bounded `WorkerExecutor` with `ordered=false`; explicit owner gates supply
+same-owner ordering. Using `ordered=true` on one shared Vert.x context is prohibited because it can
 accidentally serialize unrelated partitions across the whole pod.
 
 Blocking calls longer than the approved worker-executor budget require a dedicated bounded
@@ -118,26 +121,29 @@ deadline, cancellation, and capacity contract.
 
 ### 4.2 Partition lane state
 
-Each lane has exactly one of these states:
+Each lane is `RESTORING`, `ACTIVE`, `PAUSED`, or `REVOKED`. These are assignment/dispatch
+states, separate from the states of its many tracked records:
 
 ```text
-RESTORING -> READY -> RUNNING -> COMMITTING -> READY
-               |         |          |
-               +-------> PAUSED <----+
-                          |
-                       REVOKED
+QUEUED -> RUNNING -> COMPLETED -> COMMITTING -> COMMITTED
 ```
 
-- `RESTORING`: assignment exists but deduplication state is not caught up; no job starts.
-- `READY`: the next record may acquire capacity and a TPS token.
-- `RUNNING`: one handler is active for the partition.
-- `COMMITTING`: required Kafka outputs and the source next offset are being committed.
-- `PAUSED`: dispatch is disabled because of capacity, TPS, dependency, or Kafka failure.
-- `REVOKED`: no new operation or Kafka completion is accepted for the old assignment epoch.
+`COMPLETED` means a handler outcome (including retry/DLQ disposition) and all immutable
+required-output commands are ready in memory; it is not yet a durable acknowledgement.
+A deduplicated record can move directly from `QUEUED` to `COMPLETED`.
 
-The lane does not start offset `N+1` until offset `N` reaches a committed safe boundary or
-is deliberately left uncommitted and the lane is rewound/paused. A contiguous-offset
-tracker is therefore unnecessary in the default design.
+Each lane owns an ordered deque of every delivered, uncommitted record, completion status,
+output commands, owner gates, committed next offset, and assignment epoch. Register records
+in delivery order before dispatch. Completion callbacks run on the lane context and must
+match both epoch and execution token. A transaction snapshots a bounded completed prefix;
+later completions cannot mutate that snapshot. Only confirmed commit success retires its
+entries, updates the ledger cache, and releases their owner gates.
+
+A record may start while earlier records for other owners are running or awaiting commit.
+For each owner, start only the earliest queued record, and hold its gate until its safe
+Kafka boundary commits. This retains existing same-owner ordering and suppresses concurrent
+in-flight duplicates. Scan runnable owners fairly so a queued hot owner does not prevent
+other owners from using available slots. Global partition execution order is not promised.
 
 ### 4.3 Bounded intake
 
@@ -168,20 +174,19 @@ with the next safe offset for each named partition.
 
 The record handler routes a record by `(topic, partition)` to its lane. Lane execution is:
 
-1. verify the lane still owns the current assignment epoch;
-2. validate the record key and envelope;
-3. check the completed-request deduplication store;
-4. acquire pod capacity and a TPS permit;
-5. invoke the non-blocking handler or bounded blocking adapter;
-6. classify success, retryable failure, or terminal failure;
-7. create immutable result/lifecycle/retry/DLQ output commands;
-8. submit one completion command to the serialized transaction adapter; and
-9. release the lane only after transaction success, or pause/rewind after failure.
+1. register the delivered record in the ordered tracker under the current assignment epoch;
+2. validate key/envelope and check the restored completed-request ledger;
+3. select an eligible owner in FIFO order and acquire its gate, partition/pod capacity,
+   and a pod TPS permit before invoking a handler;
+4. classify the outcome and retain immutable result/lifecycle/retry/DLQ commands;
+5. mark that record completed, releasing handler capacity but retaining tracker capacity;
+6. collect only the completed prefix from the oldest uncommitted delivered record;
+7. submit its outputs and exact safe next offset to the serialized transaction adapter; and
+8. retire that prefix and release owner gates only after confirmed transaction success.
 
-Because every conforming job for an owner uses the same canonical `ownerId` Kafka key, all
-jobs for that owner use one partition. Serial processing of that partition is therefore a
-stronger invariant than a separate in-memory owner lock. An owner guard remains as a
-defensive metric/assertion during migration and rebalance testing.
+Validation failures and deduplicated records also pass through the tracker; neither may
+commit past unfinished work. Recheck deduplication when an owner gate becomes available.
+Same-owner records remain serial; different owners sharing their partition can overlap.
 
 ## 6. Manual Offset and Transaction Semantics
 
@@ -199,8 +204,26 @@ partition 2 -> next offset 87
 partition 5 -> next offset 32
 ```
 
-No value may move past an unfinished record in its partition. The serial lane makes the
-current record the only candidate for advancement.
+No value may move past an unfinished delivered record in its partition. Walk the tracker
+from its oldest uncommitted entry and stop at the first entry not completed. Propose one
+past the final offset in that completed prefix; never use the maximum completed offset.
+Kafka offsets can contain gaps (for example aborted transactions or control records), so
+contiguity means delivery order, not requiring every integer offset to exist. Register the
+entire delivered batch before accepting its completion callbacks; never infer a missing
+record is safe merely because a later handler finished.
+
+Example for partition 3, with committed next offset initially 100:
+
+| Source offset | State | Effect on commit |
+| --- | --- | --- |
+| 100, 101 | Completed | Commit their outputs and next offset 102. |
+| 102 | Running | Blocks further advancement. |
+| 103, 104 | Completed | Retain outcomes; cannot advance past 102. |
+| 105 | Queued | Remains uncommitted and must still execute. |
+
+When 102 completes, commit outputs for 102–104 and next offset **105** atomically.
+The committed offset is the recovery position; committing does not seek or reset the
+current consumer fetch position, which may already be beyond 105.
 
 ### 6.2 Transaction adapter
 
@@ -220,9 +243,13 @@ must never run on an event loop. Commands may arrive concurrently from partition
 but transactions never overlap. The adapter validates the assignment epoch immediately
 before beginning and immediately before committing.
 
-One record per transaction is the initial implementation. Batching completed records from
-different partitions is a later optimization and is allowed only when every entry belongs
-to the same current group generation and each proposed offset is safe.
+The initial implementation batches a bounded contiguous completed prefix from one partition
+per transaction, including every required output and ledger update for that prefix. A
+prefix may be split to meet record/byte/time limits; commit only through the included
+entries. Do not open a transaction while waiting for a handler or a gap to finish. Only one
+prefix per partition may be outstanding in the adapter; no duplicate or regressing offset
+proposals are allowed. Cross-partition batching is deferred and requires safe prefixes and
+current group metadata for every included partition.
 
 ### 6.3 Safe boundaries
 
@@ -233,8 +260,12 @@ and source next offset atomically.
 
 Fetch, validation start, queue insertion, rate-limit waiting, handler start, and external
 side-effect completion are never offset commit points. A failed or ambiguous transaction
-leaves the source record uncommitted, pauses its lane, and causes replay from the last
-committed offset after recovery.
+does not advance the local confirmed watermark and pauses dispatch. A commit timeout may
+have committed at the broker: resolve/fence the producer and recover the broker-committed
+offset and ledger before replay. Invalidate the old execution epoch/tokens, cancel or drain
+old work, clear its buffered state, and replay from that recovered position. Never seek
+back while accepting completions from the previous execution. Completed outcomes behind a
+gap are not durable and may execute again after a crash.
 
 ## 7. Backpressure and Rate Limiting
 
@@ -244,7 +275,8 @@ fleet ceiling remains `active pods * rateLimitTps`; it is not a global exact rat
 
 Backpressure has two scopes:
 
-- **partition scope** for a full lane queue, one poison record, or one lane transaction;
+- **partition scope** for a full tracking window, a stalled earliest record, or exhausted
+  partition capacity;
 - **pod scope** for shared Kafka output, transaction coordinator, or business dependency
   failure.
 
@@ -252,6 +284,19 @@ The controller uses `RUNNING`, `PAUSED`, and `PROBING`. Required-output failure 
 stops new handler starts, retains affected offsets, and uses bounded jittered recovery
 probes. Readiness becomes false after the sustained-pause threshold; liveness remains true
 while the Vert.x event loop, consumer membership, and recovery controller are responsive.
+
+Bound both queued records and the entire uncommitted tracking window (queued, running,
+completed behind gaps, and committing), in records and bytes, per partition and pod.
+Completed outcomes still consume this window after releasing handler capacity. At high
+watermark pause fetching and stop admitting new work; already admitted work must retain
+capacity to finish and close the earliest gap. Resume below the low watermark. Reserve
+headroom for client buffering and an in-progress poll; never silently drop overflow records
+and subsequently commit past them. Overflow triggers fenced recovery from committed state.
+Bound transaction batch bytes and output size too. A stuck earliest record reaches its
+handler deadline and retry/DLQ policy; timeout alone is never successful completion.
+A timed-out call that cannot be cancelled retains its execution permit until it exits, or
+requires worker replacement; do not free capacity and accumulate unbounded zombie calls.
+External fencing/idempotency is still required across ambiguous calls and ownership changes.
 
 TPS waiting must not occupy a worker thread. It uses Vert.x timers and resumes the lane
 when a permit and capacity are available. Zero TPS is an administrative pause.
@@ -298,8 +343,10 @@ Assignment creates a monotonically increasing local epoch and starts ledger rest
 Revocation marks the lane `REVOKED` before any drain begins, pauses dispatch, and rejects
 new completion commands for the old epoch.
 
-The worker drains within a configured deadline. Work that reaches a safe Kafka transaction
-may complete; other work is abandoned without committing and is redelivered. A late
+After revocation, no new transaction for that partition may begin. Resolve or abort any
+already-submitted transaction with broker group fencing; then recover authoritative offsets
+and ledger state on reassignment. Drain/cancel handlers within a configured deadline;
+uncommitted records, including completed records behind gaps, are redelivered. A late
 external result from a revoked lane is observable but cannot publish Kafka outputs or
 offsets through the stale epoch.
 
@@ -327,6 +374,10 @@ The worker validates at startup:
 | Isolation | Exactly `read_committed`. |
 | Partition assignment strategy | Supported cooperative strategy, integration-tested. |
 | Queue high/low watermarks | Positive, bounded, and compatible with `max.poll.records`. |
+| `maxInFlightPerPartition` | Positive; greater than one in the target concurrent deployment. |
+| `maxInFlightPerPod` | Positive, independently limits total active handlers. |
+| Tracking window records/bytes | Bounded per partition and pod, includes completed outcomes and client-buffer headroom. |
+| Transaction batch records/bytes | Positive, bounded by window, producer limits, and transaction timeout. |
 | Handler/worker capacity | Positive and bounded by pod resources. |
 | TPS and burst | Non-negative TPS; positive burst for positive TPS. |
 | Handler/transaction/drain timeouts | Positive and consistent with Kafka and Kubernetes timing. |
@@ -360,7 +411,8 @@ Metrics and structured logs include:
 - event-loop delay and blocked-thread warnings;
 - worker-executor active, queued, rejected, and duration measurements;
 - assigned/restoring/ready/paused partitions and rebalance epochs;
-- lane state, queue depth, current source offset, and transaction wait;
+- lane state, queued/running/completed-uncommitted counts and bytes, owner-gate wait,
+  committed and candidate next offsets, earliest-gap age, and transaction wait;
 - fetched, started, succeeded, retried, DLQ, deduplicated, and conflicted totals;
 - per-pod TPS permits and start rate;
 - transaction begin/commit/abort/fence latency and failures;
@@ -381,9 +433,16 @@ Required scenarios are:
 
 | ID | Scenario | Required proof |
 | --- | --- | --- |
-| `VTX-LANE-01` | One pod owns three partitions | Three handlers may overlap, but never two from one partition. |
-| `VTX-LANE-02` | Two records share one partition | Second starts only after first transaction commits. |
-| `VTX-OFF-01` | Four records fetched from one partition | Only the current lane record can advance that partition to `offset + 1`; fetch position is never committed. |
+| `VTX-LANE-01` | One pod owns three partitions | Handlers overlap within and across partitions under both capacity limits. |
+| `VTX-LANE-02` | Different owners share one partition | Handlers overlap and finish out of order; same-owner records wait for the prior commit. |
+| `VTX-OFF-01` | Four records fetched from one partition | Completion order never skips unfinished delivered records; fetch position is never committed. |
+| `VTX-OFF-02` | 100/101 done, 102 running, 103/104 done, 105 queued | Commit 102, then 105 only after 102 completes; verify prefix outputs atomically. |
+| `VTX-OFF-03` | Delivered offsets contain Kafka gaps | Tracker advances across absent broker offsets, never across unfinished delivered entries. |
+| `VTX-OFF-04` | Crash with completed work behind a gap | Recovery starts at broker commit; later non-durable outcomes replay. |
+| `VTX-OFF-05` | Execution verticle fails on 102 after 100/101/103/104 finish | Only 100/101 commit (next offset 102); failed/unresolved 102 blocks 103/104 until safe resolution; recovery never skips 102. |
+| `VTX-WINDOW-01` | Earliest record stalls while later handlers finish | Tracking bytes/count stay bounded; head can finish; heartbeat and other partitions remain responsive. |
+| `VTX-TX-03` | Commit times out or prefix exceeds batch limits | Resolve broker state before replay; split batches commit only included prefixes. |
+| `VTX-DEDUP-04` | Same identity arrives while original is running | Owner gate prevents overlap; post-commit ledger recheck suppresses duplicate. |
 | `VTX-TX-01` | Result send succeeds, lifecycle send fails | Transaction aborts; no output is visible to `read_committed`, source offset is unchanged. |
 | `VTX-TX-02` | Two partition lanes complete together | Dedicated adapter serializes transactions and commits independent exact offsets. |
 | `VTX-BP-01` | Output Kafka is unavailable | Lanes pause, queues remain bounded, event loop/heartbeats remain responsive, then recover. |
@@ -395,10 +454,50 @@ Required scenarios are:
 | `VTX-TTL-01` | Ledger entry expires | Tombstone removes it; documentation states replay may execute again. |
 | `VTX-POD-01` | One pod is killed during load | Assignments recover, queues stay bounded, and duplicates/lag are measured. |
 | `VTX-CAP-01` | 20,000/day and compressed bursts | Per-pod TPS, owner serialization, lag, and recovery objectives hold. |
-| `VTX-CAP-02` | 100,000/day and compressed bursts | Scale partitions/pods under the controlled partition-expansion procedure. |
+| `VTX-CAP-02` | 100,000/day and compressed bursts | Meet agreed throughput with low fixed partition counts by tuning within-partition concurrency and pod resources; measure limits before proposing expansion. |
 
 Every test asserts zero event-loop blocking, zero skipped source offsets, zero same-owner
 overlap, bounded queues, and no Kafka output/source-offset partial commit.
+
+### Failed execution verticle at offset 102 (`VTX-OFF-05`)
+
+Implement a deterministic tracker unit test and a real-Kafka integration/chaos test with
+execution barriers, rather than timing-dependent sleeps:
+
+1. Assign one partition to one consumer pod. Deliver offsets 100–105 for distinct owners,
+   enable at least five concurrent handler slots, and keep 105 queued using a test barrier.
+   Start with broker-committed next offset 100. Execution verticles/adapters return outcomes
+   to the partition coordinator; they never commit consumer offsets themselves.
+2. Complete 100 and 101 and await their confirmed prefix transaction. Independently query
+   the consumer group's committed offset and assert **102**, meaning records through **101**
+   are committed.
+3. Let the handlers for 103 and 104 finish while holding 102 at a barrier. Assert their
+   outcomes are retained as `COMPLETED`, with no result/lifecycle/ledger output visible to
+   `read_committed` consumers yet, and committed next offset still 102.
+4. Inject failure into the execution handling 102. Cover both a failed handler Future and
+   execution verticle undeployment/lost completion. Hold retry/DLQ resolution at a test
+   barrier so the source record remains unresolved. Assert no success acknowledgement,
+   owner-gate release, or offset advancement results merely from failure, undeployment,
+   timeout, or completion of 103/104. A failed Future alone does not imply the verticle was
+   undeployed; record the actual lifecycle event separately from the failed job outcome.
+5. Verify the partition coordinator and consumer stay responsive, the missing completion
+   is detected by supervision/deadline, and retained outcomes remain within window limits.
+   The failure must not silently strand 102 forever: classify it for the configured recovery
+   policy, but leave it uncommitted while that disposition is unresolved. Confirm the failed
+   execution's token is invalidated and late success callbacks cannot mark it completed.
+6. Exercise two independent recovery branches from the unresolved state:
+   - Release the recovery barrier and safely resolve 102 through success or its configured
+     retry/DLQ disposition. Commit all required outputs for the included prefix atomically;
+     the watermark may reach **105** only when 102–104 are covered by confirmed transactions.
+     A retry/DLQ outcome counts as resolved only at that durable boundary, not at the throw.
+   - Kill/restart the pod before resolution. Verify reassignment starts from committed next
+     offset **102**, replays 102/103/104, and restores the ledger before dispatch. The prior
+     in-memory outcomes for 103/104 are not durable and their handlers may execute again;
+     verify downstream idempotency. Records 100/101 must not replay in normal recovery.
+
+Capture handler start/completion and verticle lifecycle events, execution tokens, tracker
+states, broker-committed offsets, transaction outcomes, and `read_committed` output records.
+The test fails if any commit exceeds 102 while source record 102 remains unresolved.
 
 ## 14. Migration
 
@@ -427,11 +526,12 @@ Spec 007 is complete when:
 1. the production pull worker runs as a Dockerized Java 21/Vert.x 5 service;
 2. client topic, schema, and `ownerId` partitioning contracts remain compatible;
 3. no scheduler database or Python runtime is present in the worker image;
-4. each partition is processed sequentially while different assigned partitions run
-   concurrently;
+4. different owners execute concurrently within an assigned partition and across partitions,
+   under explicit pod/partition limits, while same-owner records remain serial;
 5. no blocking handler or Kafka transaction operation runs on an event loop;
 6. the no-argument consumer commit is not used for processed work;
-7. exact source next offsets and required outputs commit in one Kafka transaction;
+7. bounded contiguous completed prefixes and all their required outputs commit atomically,
+   never advancing past an unfinished delivered record;
 8. required-publication failure pauses intake without losing group responsiveness;
 9. one pod-wide TPS limiter governs all partition lanes;
 10. current assignment epochs fence late completions after rebalance;
@@ -446,7 +546,7 @@ Spec 007 is complete when:
 - Future/delayed job scheduling and delayed retry.
 - Exactly-once execution of an arbitrary external business side effect.
 - A globally exact TPS limit across pods.
-- Concurrent execution of multiple offsets from the same partition.
+- Concurrent execution of records for the same owner within an assignment.
 - Automatic Kafka partition-count changes without an ordering migration.
 - Rewriting the Python simulator or visibility projection in Java.
 - Cross-owner global enforcement of a reused `jobId` without an ingestion identity service.
@@ -460,3 +560,5 @@ Spec 007 is complete when:
 - [Vert.x Kafka client issue for consumed offsets in transactions](https://github.com/vert-x3/vertx-kafka-client/issues/269)
 - [Vert.x Core threading model](https://vertx.io/docs/vertx-core/java/)
 - [Vert.x 5 migration guide](https://vertx.io/docs/guides/vertx-5-migration-guide/)
+
+- [Apache Kafka consumer offset and position semantics](https://kafka.apache.org/41/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html)

@@ -2,7 +2,7 @@
 
 Status: proposed for review
 
-Last updated: 2026-09-06
+Last updated: 2026-09-07
 
 Governing specification: [`spec.md`](spec.md)
 
@@ -30,8 +30,8 @@ producer contracts.
 ### 1.1 Purpose
 
 Clients publish immediately executable jobs directly to Kafka using canonical `ownerId` as
-the record key. Vert.x worker pods consume the topic, serialize work within each partition,
-run different assigned partitions concurrently, limit starts per pod, and commit required
+the record key. Vert.x worker pods consume the topic, run bounded concurrent work within and across partitions,
+serialize records for each owner, limit starts per pod, and commit required
 Kafka outcomes with exact source offsets.
 
 The scheduler database remains removed. Kafka contains the work, durable outcomes,
@@ -41,10 +41,10 @@ lifecycle evidence, failure quarantine, completed-request ledger, and consumer o
 
 | Priority | Goal | Architectural response |
 | ---: | --- | --- |
-| 1 | Offset correctness | One serial lane per partition and explicit next-offset transactions. |
-| 2 | Owner serialization | Canonical `ownerId` partition key and no same-partition overlap. |
+| 1 | Offset correctness | Contiguous-completion tracker and atomic prefix transactions per partition. |
+| 2 | Owner serialization | Canonical `ownerId` key and FIFO owner gates held through commit. |
 | 3 | Reactive responsiveness | Event-loop-confined control state and no blocking event-loop calls. |
-| 4 | Useful concurrency | Independent assigned partition lanes execute concurrently. |
+| 4 | Useful concurrency | Multiple owners in one assigned partition execute concurrently. |
 | 5 | Bounded load | Pod-wide token bucket, lane queues, worker executor, and pause/resume. |
 | 6 | Atomic Kafka completion | Required outputs, ledger record, and source offset use one transaction. |
 | 7 | Completed duplicate suppression | Kafka-backed partition-local ledger restored before readiness. |
@@ -69,7 +69,7 @@ lifecycle evidence, failure quarantine, completed-request ledger, and consumer o
 - Requests are eligible immediately and are keyed by canonical `ownerId`.
 - `ownerId` represents either `subscriber:<id>` or `group:<id>` as declared by `ownerType`.
 - All production replicas use one consumer group.
-- Each assigned partition processes exactly one active record at a time.
+- Each assigned partition processes bounded concurrent records for different owners.
 - Different assigned partitions may process concurrently.
 - Auto commit is disabled and fetched positions are never treated as processed offsets.
 - Required result/lifecycle/retry/DLQ records precede or share the source commit boundary.
@@ -146,16 +146,17 @@ are migration/reference systems, not production peers after cutover.
 1. Keep Spec 006's work, result, lifecycle, retry, DLQ, and `ownerId` contracts.
 2. Replace the production Python worker with one Vert.x service per pod.
 3. Confine Kafka consumer control and mutable lane state to Vert.x contexts.
-4. Route each record to a serial lane identified by its topic and partition.
-5. Allow lanes for different partitions to execute concurrently.
+4. Register each record in an ordered tracker identified by topic and partition.
+5. Dispatch different owners within and across partitions under pod/partition limits.
 6. Prefer non-blocking handlers; isolate unavoidable blocking work in a bounded executor.
 7. Serialize Kafka transactions on a dedicated adapter outside the event loop.
 8. Atomically publish required outcomes, ledger updates, and exact source offsets.
 9. Pause partitions at bounded queue watermarks or failure boundaries.
 10. Restore the ledger for an assignment before advertising readiness.
 
-This structure obtains concurrency from Kafka partitions. It does not need concurrent
-offsets within one partition, so manual commit semantics remain simple and auditable.
+This structure keeps partition counts low by separating handler concurrency from assignment
+count. Same-owner FIFO preserves the existing ordering contract; a contiguous tracker
+prevents out-of-order completion from acknowledging unfinished work.
 
 ## 5. Building-Block View
 
@@ -186,7 +187,7 @@ flowchart LR
     boot["Bootstrap and config"]
     consumer["Consumer controller"]
     router["Partition router"]
-    lanes["Serial partition lanes"]
+    lanes["Concurrent partition coordinators"]
     capacity["Capacity gate"]
     limiter["Pod TPS limiter"]
     handlers["Handler registry and adapters"]
@@ -217,7 +218,7 @@ flowchart LR
 | Bootstrap | Validate config/topics and construct dependencies. | Startup context; bounded async calls. |
 | Consumer controller | Subscription, assignment, pause/resume, close. | One context-owned actor. |
 | Partition router | Route records and enforce bounded queues. | Consumer context. |
-| Partition lane | Serialize one partition's state and Future chain. | Context-confined; one active job. |
+| Partition lane | Track delivery order, owner gates, and concurrent outcomes. | Context-confined; bounded active jobs. |
 | TPS limiter | Grant pod-wide start permits using monotonic time. | Context-confined timers. |
 | Async handler | Invoke non-blocking Vert.x clients. | Event loop, never blocking. |
 | Blocking adapter | Bridge legacy blocking handler. | Dedicated bounded worker executor. |
@@ -244,23 +245,24 @@ sequenceDiagram
     L->>L: Check ledger and acquire TPS
     L->>B: Execute with jobId and attempt idempotency key
     B-->>L: Success
-    L->>T: Submit outputs ledger record and exact next offset
+    L->>L: Mark completed and collect bounded completed prefix
+    L->>T: Submit prefix outputs ledger records and safe next offset
     T->>K: Begin transaction and send records
     T->>K: Send source next offset with group metadata
     T->>K: Commit transaction
     K-->>T: Transaction committed
     T-->>L: Safe completion
-    L->>L: Release lane and start next offset
+    L->>L: Retire prefix and release its owner gates
 ```
 
-### 6.2 Concurrent partitions
+### 6.2 Concurrency within and across partitions
 
 ```mermaid
 flowchart LR
     consumer["One consumer controller"]
-    p0["Partition 0 lane: 10 then 11"]
-    p2["Partition 2 lane: 40 then 41"]
-    p5["Partition 5 lane: 70 then 71"]
+    p0["Partition 0: 10 and 11 overlap"]
+    p2["Partition 2: 40 and 41 overlap"]
+    p5["Partition 5: 70 and 71 overlap"]
     tx["Serialized transaction adapter"]
 
     consumer --> p0
@@ -271,10 +273,10 @@ flowchart LR
     p5 -->|"completion command"| tx
 ```
 
-Offsets 10, 40, and 70 may execute simultaneously. Offsets 11, 41, and 71 cannot start
-until the preceding transaction in their own lane succeeds. Transaction serialization may
-briefly queue completed lanes but does not force their business handlers to run globally
-one at a time.
+All six offsets may execute simultaneously when their owners differ and capacity permits.
+Within each partition, only a completed prefix can commit. Same-owner records wait for
+the preceding owner record to commit. Completed outcomes behind a gap consume bounded
+tracking-window capacity even after their handlers release execution permits.
 
 ### 6.3 Completed duplicate
 
@@ -288,7 +290,8 @@ sequenceDiagram
     K->>L: Redeliver completed jobId and attempt
     L->>S: Lookup logical identity and immutable hash
     S-->>L: Completed matching outcome
-    L->>T: Submit duplicate outcome and exact source next offset
+    L->>L: Mark duplicate completed in ordered tracker
+    L->>T: Submit only when included in completed prefix
     T->>K: Commit Kafka transaction without business call
     K-->>T: Transaction committed
 ```
@@ -364,16 +367,16 @@ flowchart TB
     podN <--> ledger
 ```
 
-One pod can actively use at most its assigned partition count. With six partitions and two
-pods, the stable distribution is normally three lanes per pod and six concurrent jobs in
-the fleet. With six partitions and more than six pods, extra pods have no work assignment.
+One pod can run up to `min(maxInFlightPerPod, assignedPartitions * maxInFlightPerPartition)`
+handlers, subject to distinct eligible owners, executor capacity, and TPS. One partition
+can support eight concurrent handlers when the configured limits permit it. With six partitions and more than six pods, extra pods have no work assignment.
 Stable worker-slot identities, such as StatefulSet ordinals, form transactional IDs. A
 replacement reuses the slot ID to fence a zombie predecessor; separate live slots never
 share one.
 
 Scaling to 100,000 requests/day is driven by peak rate, handler duration, owner skew, and
-recovery objective rather than the daily average. Add pods up to the existing partition
-count first. Increase partitions only through an ordering-aware migration because the
+recovery objective rather than the daily average. Tune within-partition concurrency and pod resources at fixed low partition counts first;
+add pods up to the existing partition count when justified by measured capacity. Increase partitions only through an ordering-aware migration because the
 `ownerId` hash mapping changes for newly produced records. The ledger topic must expand in
 lockstep, and cutover must prevent one owner from overlapping old and new mappings.
 
@@ -383,19 +386,21 @@ lockstep, and cutover must prevent one owner from overlapping old and new mappin
 
 Event loops own control-plane state and compose asynchronous Futures. Blocking work is
 explicitly isolated. `executeBlocking(..., ordered=false)` is used behind a named bounded
-executor when required because partition lanes already establish order. Event-loop delay
+executor when required because explicit owner gates establish same-owner order. Event-loop delay
 and executor saturation are release metrics, not merely debug logs.
 
 ### 8.2 Offset safety
 
 The service never calls no-argument `consumer.commit()` for work completion. It constructs
-an exact map of next offsets. A partition lane can propose only its current source offset
-plus one. A transaction adapter may combine proposals only after verifying current group
-generation and distinct partitions.
+an exact map from bounded contiguous completed prefixes. With 100/101 completed, 102
+running, 103/104 completed, and 105 queued, commit 102. When 102 completes, atomically
+commit outputs for 102–104 and next offset 105. Committing changes the recovery position,
+not the current fetch position. Contiguity is over registered delivered records, since
+Kafka offsets may have broker-level gaps. Never use the highest completed or fetched offset.
 
-If four offsets were fetched from one partition, processing offset 10 permits committing
-11, not the consumer's fetched position 14. Offset 11 starts only after 11 is durably the
-committed next position.
+Only confirmed commit success retires a prefix. One prefix per partition may be outstanding;
+snapshot commands cannot change while queued. Ambiguous commits require broker offset and
+ledger recovery before replay, with old execution tokens invalidated. See spec sections 4–7.
 
 ### 8.3 Transaction ownership
 
@@ -421,7 +426,9 @@ redelivery and support window is shorter than two hours.
 
 ### 8.5 Backpressure and capacity
 
-Per-partition high/low watermarks protect memory. The pod TPS token bucket protects the
+Per-partition and pod record/byte watermarks cover queued, running, completed, and committing
+entries. Reserve client-buffer headroom and allow admitted work to close the earliest gap.
+A completed outcome behind a gap retains window capacity; handler capacity is separate. The pod TPS token bucket protects the
 business dependency. The transaction-adapter queue protects Kafka/JVM resources. Any gate
 can pause affected partitions without committing records merely because they were fetched.
 
@@ -444,13 +451,13 @@ metric labels.
 | ID | Decision | Rationale | Consequence |
 | --- | --- | --- | --- |
 | ADR-007-01 | Production pull workers use Java 21 and Vert.x 5. | Matches the target reactive microservice platform. | A separate Maven module and image replace the Python worker. |
-| ADR-007-02 | One consumer controller exists per pod. | Keeps group membership and assignment state coherent. | Scale comes from partitions and pods, not extra consumers in one pod. |
-| ADR-007-03 | One active record is allowed per partition. | Makes ordering and manual commits unambiguous. | Unrelated owners sharing a partition are serialized. |
-| ADR-007-04 | Different partition lanes execute concurrently. | Uses Kafka parallelism without offset gaps. | Pod concurrency is bounded by assignments and capacity. |
+| ADR-007-02 | One consumer controller exists per pod. | Keeps group membership and assignment state coherent. | Handler concurrency comes from bounded dispatch within assigned partitions. |
+| ADR-007-03 | Bounded concurrent records are allowed per partition. | Keep partition counts low while using handler capacity. | Owner gates and contiguous trackers are required. |
+| ADR-007-04 | Dispatch within and across partitions. | Use available capacity despite slow unrelated owners. | Explicit partition/pod limits bound handler concurrency. |
 | ADR-007-05 | Event loops never run blocking handlers or Kafka transaction calls. | Preserves consumer and health responsiveness. | Bounded dedicated executors are required. |
 | ADR-007-06 | No-argument consumer commit is forbidden. | It may acknowledge fetched but unfinished records. | Exact offset maps are always constructed. |
 | ADR-007-07 | Kafka transaction lifecycle is serialized in one adapter. | Producer transactions cannot overlap and Vert.x lacks the required high-level offset API. | Transaction throughput is measured as a potential bottleneck. |
-| ADR-007-08 | One source record uses one transaction initially. | Simplifies failure, lane release, and evidence. | Cross-partition transaction batching is deferred. |
+| ADR-007-08 | One bounded completed prefix uses one transaction initially. | Couple every prefix output with its safe next offset. | Retain outcomes behind gaps; cross-partition batching is deferred. |
 | ADR-007-09 | Completed deduplication uses a compacted Kafka ledger plus local restored stores. | Avoids reintroducing a scheduler database or relying on ephemeral caches. | Assignment readiness waits for restore. |
 | ADR-007-10 | Dedup retention follows the recovery/replay window, not an arbitrary TTL. | A short TTL silently reopens duplicate execution. | Cleanup requires governed tombstones. |
 | ADR-007-11 | External operations receive `(jobId, attempt)` idempotency keys. | Kafka cannot atomically commit an external side effect. | Dependencies unable to honor the key retain at-least-once effects. |
@@ -460,8 +467,9 @@ metric labels.
 
 | Scenario | Required response |
 | --- | --- |
-| Pod owns three partitions | Up to three handlers run concurrently, one per partition. |
-| Four records are fetched from one partition | Only the lowest record executes; commit advances exactly one safe next offset. |
+| Pod owns three partitions | Multiple handlers per partition overlap within pod/partition capacity. |
+| Four records are fetched from one partition | Different owners overlap; commits stop before the earliest unfinished delivered record. |
+| Execution verticle fails at 102 after 100/101/103/104 finish | Commit only through 101 (next offset 102); supervise failed execution, retain later outcomes, and resolve or replay 102 before advancing (`VTX-OFF-05`). |
 | TPS capacity is exhausted | Lanes wait on timers without occupying worker/event-loop threads. |
 | Output Kafka fails | Transaction aborts, offset remains unchanged, queues stay bounded, and intake pauses. |
 | One blocking handler stalls | Event loop, health, Kafka control, and other lanes remain responsive. |
@@ -470,29 +478,29 @@ metric labels.
 | New pod receives a partition | It restores ledger state before readiness and dispatch. |
 | Immutable duplicate conflicts | It is quarantined and does not reuse a prior success. |
 | One owner carries half of traffic | Owner remains serial; skew and head-of-line delay are visible. |
-| Volume rises to 100,000/day | Existing partitions scale through more pods first; expansion follows controlled remapping. |
+| Volume rises to 100,000/day | Tune concurrency and resources at low fixed partition counts; expansion requires evidence and controlled remapping. |
 | Transaction adapter saturates | Its bounded queue pauses lanes and emits saturation metrics. |
 
 ## 11. Risks and Technical Debt
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Transaction adapter becomes bottleneck | Handler concurrency does not translate into completion throughput. | Benchmark one-record transactions; later batch safe cross-partition completions. |
+| Transaction adapter becomes bottleneck | Handler concurrency does not translate into completion throughput. | Benchmark bounded prefix batches and transaction queue saturation. |
 | Incorrect native-client threading | Event-loop stalls or unsafe consumer metadata access. | Encapsulated adapter, thread-affinity tests, no general `unwrap()` usage. |
 | Vert.x pause has buffered records | Queue temporarily receives records after pause. | Size for `max.poll.records`, enforce bounded router, test high-water behavior. |
 | Ledger restore delays readiness | Rebalance recovery takes longer. | Partitioned restore, restore metrics, retention/compaction tuning. |
 | Ledger TTL is too short | Old duplicate executes again. | Tie retention to declared recovery/replay window and alert before expiry. |
 | External effect is ambiguous at crash | Physical duplicate remains possible. | Dependency idempotency key, explicit metrics, chaos proof. |
-| Hot owner limits one partition | Owner throughput cannot scale horizontally. | Measure skew; split owner only through a business-approved ordering change. |
+| Hot owner blocks commit progress | Later owners can execute, but completed outcomes accumulate behind gaps. | Bound tracking memory and gap age; maintain same-owner FIFO. |
 | Partition expansion remaps owners | Old and new owner jobs may overlap. | Quiesce/drain or versioned-topic migration with owner fencing. |
 
 ## 12. Glossary
 
 | Term | Meaning |
 | --- | --- |
-| Partition lane | Serial asynchronous state machine for one assigned topic partition. |
+| Partition lane | Context-owned coordinator for concurrent records, owner gates, and completion tracking. |
 | Consumer controller | Context-owned Vert.x component controlling subscription and assignments. |
-| Exact next offset | The processed record offset plus one, committed for a named partition. |
+| Exact next offset | One past the last record in an included contiguous completed prefix. |
 | Transaction adapter | Single-thread component coupling Kafka outputs and consumed offsets. |
 | Assignment epoch | Local generation token invalidated when a partition is revoked. |
 | Completed ledger | Kafka-backed record of a completed logical `(jobId, attempt)`. |
