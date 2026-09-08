@@ -1,275 +1,93 @@
-# Job Scheduling Simulation
+# Vert.x Kafka Pull Worker (Spec 007)
 
-A deterministic Python simulation for scheduled-job visibility when an external scheduler polls once per minute and retrieves at most `X` jobs per poll.
+This repository contains the Spec 007 Java 21 / Vert.x 5 Kafka pull worker. It consumes
+immediately eligible subscriber and group requests, executes different owners concurrently,
+preserves FIFO ordering for the same owner, and commits completed Kafka prefixes atomically
+with their source offsets.
 
-The model keeps submission acknowledgement, scheduler retrieval, execution start, and terminal outcome as separate observed facts. It also measures polling delay, batch backlog, worker delay, EDR freshness, retries, and lifecycle inconsistencies.
+Spec 007 is implemented and validated locally. Production migration, environment-specific
+capacity, security, and acceptance gates remain open.
 
-## Run
+## Start here
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-.venv/bin/pytest
-.venv/bin/job-visibility-sim --pretty --output simulation-results/full.json
-```
+- [Worker source and direct-run notes](vertx-pull-worker/README.md)
+- [Spec 007 specification](specs/007-vertx-kafka-pull-worker/spec.md)
+- [Spec 007 implementation plan](specs/007-vertx-kafka-pull-worker/plan.md)
+- [Spec 007 arc42 architecture](specs/007-vertx-kafka-pull-worker/arc42.md)
+- [Spec 007 runbook](docs/spec-007-runbook.md)
+- [Spec 007 evidence](docs/spec-007-evidence.md)
+- [Root architecture overview](architecture.md)
 
-Run a single scenario or the CI subset:
+## Architecture at a glance
 
-```bash
-.venv/bin/job-visibility-sim POLL-04 --pretty
-.venv/bin/job-visibility-sim ci --output simulation-results/ci.json
-```
+Each workload fleet uses one subscribed Kafka consumer per pod. Kafka assigns partitions to
+the pods, and each assigned partition has a context-confined lane with bounded concurrency.
+Different owners may run at the same time; records for one owner remain serialized until the
+Kafka transaction containing their safe source-offset prefix commits.
 
-Start the visibility API:
+The worker provides:
 
-```bash
-.venv/bin/uvicorn job_visibility.api:app --reload
-```
+- subscriber and group workload isolation through separate topics, consumer groups, fleets,
+  capacity budgets, and TPS limits;
+- exact manual source-offset tracking with contiguous-completion prefixes;
+- durable attempt and completion EDRs, result records, retry/DLQ records, and completed-request
+  deduplication;
+- partition pause/resume, bounded queues, pod-wide adaptive admission, and isolated retry
+  requeue deployments; and
+- readiness, health, metrics, tracing, rebalance fencing, bounded drain, and recovery behavior.
 
-The visibility specification and implementation plan are in
-[`specs/001-scheduled-job-visibility`](specs/001-scheduled-job-visibility/). The durable
-PostgreSQL and Kafka architecture is specified in
-[`specs/002-real-persistence-kafka`](specs/002-real-persistence-kafka/).
-Production hardening, automated chaos evidence, and release gates are defined in
-[`specs/003-production-hardening-resilience`](specs/003-production-hardening-resilience/).
-Production API composition and the standalone scheduler runtime are specified in
-[`specs/004-production-api-runtime`](specs/004-production-api-runtime/).
-Resource-pressure experiments and deterministic application fault injection are specified in
-[`specs/005-resource-pressure-fault-injection`](specs/005-resource-pressure-fault-injection/).
-The proposed Kafka pull-based scheduler replacement is specified in
-[`specs/006-kafka-pull-job-scheduler`](specs/006-kafka-pull-job-scheduler/).
-The target Java 21/Vert.x 5 worker architecture, partition-lane concurrency, exact manual
-offset model, and completed-request deduplication are specified in
-[`specs/007-vertx-kafka-pull-worker`](specs/007-vertx-kafka-pull-worker/).
-The arc42-aligned C4 architecture documentation is in [`architecture.md`](architecture.md).
-The latest human-readable run report is in
-[`simulation-results/summary.md`](simulation-results/summary.md).
+The worker does not own a scheduler database, due-job query, scheduler outbox, or visibility
+API. Kafka is the work and execution-state boundary. External business effects remain at least
+once across an ambiguous external-call failure, so handlers must use the stable `jobId` as an
+idempotency key when supported.
 
-## Spec 006 Kafka pull workers
+## Quick start
 
-Start Kafka, Schema Registry, topic setup, and two database-free pull-worker containers:
+Run from the repository root. Host tests require Java 21 and Maven 3.6.3 or newer. Container
+workflows require Docker Engine and Docker Compose.
 
 ```bash
-docker compose --profile pull up --build kafka schema-registry kafka-setup \
-  pull-worker-1 pull-worker-2
+scripts/spec007 test     # unit and real-Kafka integration tests
+scripts/spec007 build    # build spec007-worker:local
+scripts/spec007 smoke    # two workers and synthetic HTTP dependency
+scripts/spec007 produce 100
 ```
 
-Publish an immediately eligible test request through the same application image:
+Run the larger local checks with a running baseline:
 
 ```bash
-docker compose --profile pull run --rm pull-worker-1 job-visibility-pull produce \
-  --job-id job-1 \
-  --owner-id subscriber:123 \
-  --owner-type SUBSCRIBER \
-  --correlation-id demo-1 \
-  --payload '{"message":"hello"}'
+scripts/spec007 baseline  # five workers and ten partitions
+scripts/spec007 capacity 1000
+scripts/spec007 capacity  # 20,000 and 100,000 compressed requests
+scripts/spec007 chaos     # kill one baseline worker and verify recovery
 ```
 
-Both workers use Kafka consumer group `job-workers-v1`; each has a distinct instance and
-transactional producer ID. The local work topic has six partitions. The pull-worker
-containers do not receive scheduler database credentials.
-
-## Spec 002 local infrastructure
-
-The durable stack uses physically separate scheduler and EDR PostgreSQL containers, Kafka in
-KRaft mode, Schema Registry, Kafka Connect, Cassandra, and a Toxiproxy endpoint on port 9042.
-Container tags and the JDBC connector version are pinned in `compose.yaml`.
+Check readiness inside a worker:
 
 ```bash
-scripts/infra bootstrap
-
-export SCHEDULER_DATABASE_URL='postgresql+psycopg://scheduler_owner:scheduler-local@localhost:5432/scheduler'
-export EDR_DATABASE_URL='postgresql+psycopg://edr_owner:edr-local@localhost:5433/edr'
-.venv/bin/alembic -n scheduler upgrade head
-.venv/bin/alembic -n edr upgrade head
-bash infra/kafka/connect/apply.sh
+docker compose -f compose.yaml -f compose.spec007.yaml exec -T spec007-subscriber-0 \
+  wget -q -O - http://localhost:8080/health/ready
 ```
 
-The bounded infrastructure interface also provides `ready`, `migrate`, `connector-apply`,
-`test-postgres`, `test-resilience`, `diagnostics`, and `down` commands. Destructive volume
-cleanup requires `CONFIRM_DELETE_TEST_VOLUMES` to exactly match the named Compose project.
+Readiness waits for Kafka assignment and durable ledger restoration before dispatch.
 
-Run the durable background roles independently:
+## Workloads
 
-```bash
-.venv/bin/job-visibility-runtime publisher
-.venv/bin/job-visibility-runtime projector
-.venv/bin/job-visibility-runtime rebuild --once
-```
+| Workload | Default work topic | Kafka key | Envelope owner |
+| --- | --- | --- | --- |
+| Subscriber | `v007-subscriber-rerate` | `42` | `subscriber:42` |
+| Group | `v007-group-rerate` | `17` | `group:17` |
 
-## Production-like HTTP path
+The exact production topic names, schemas, deployment settings, and migration rules are
+defined by the [Spec 007 specification](specs/007-vertx-kafka-pull-worker/spec.md). The local
+demo uses synthetic data and a synthetic dependency only.
 
-Start the infrastructure, migrations/connector, and role-isolated application services:
+## Validation status
 
-```bash
-scripts/infra bootstrap
-scripts/infra up-apps
-scripts/infra smoke-http
-```
+The current local evidence includes unit and Kafka integration tests, compressed 20,000 and
+100,000 request capacity runs, and recovery of requests after a worker container kill. These
+results demonstrate the local implementation and do not establish production business
+throughput or availability.
 
-The scheduler API listens on port 8000 and owns only scheduler PostgreSQL access. The
-visibility API listens on port 8001 and reads only EDR PostgreSQL projections. The apps
-profile also starts the scheduler worker, outbox publisher, and projector.
-
-Submit a job directly:
-
-```bash
-curl -X POST http://localhost:8000/scheduler/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "jobId":"example-fibonacci-1",
-    "correlationId":"example-order-1",
-    "jobType":"FIBONACCI",
-    "scheduledAt":"2026-08-21T12:00:00Z",
-    "payload":{"limit":10000},
-    "maxAttempts":3
-  }'
-```
-
-Read its EDR-derived projection and attempts independently:
-
-```bash
-curl http://localhost:8001/scheduled-jobs/example-fibonacci-1
-curl http://localhost:8001/scheduled-jobs/example-fibonacci-1/attempts
-curl 'http://localhost:8001/scheduled-jobs?correlationId=example-order-1'
-```
-
-For host-managed processes, use `job-visibility-api scheduler`,
-`job-visibility-api visibility`, and `job-visibility-runtime scheduler`. The original
-`uvicorn job_visibility.api:app` command remains the in-memory simulation API.
-
-The publisher leases scheduler outbox rows and records Kafka acknowledgements. Kafka Connect
-is the only writer to the immutable raw EDR journal. The projector reads that journal and
-updates the durable visibility tables; rebuild derives projections from the EDR database
-alone. Operational recovery guidance is in
-[`docs/spec-002-runbook.md`](docs/spec-002-runbook.md).
-The failure model, discovered defects, recovery mechanisms, verified scenarios, and remaining
-chaos-test gaps are documented in [`docs/chaos.md`](docs/chaos.md).
-The bounded resilience workflow and current automation evidence are documented in
-[`docs/spec-003-runbook.md`](docs/spec-003-runbook.md) and
-[`docs/spec-003-evidence.md`](docs/spec-003-evidence.md).
-The production HTTP operating procedure is in
-[`docs/spec-004-runbook.md`](docs/spec-004-runbook.md).
-The bounded resource-pressure and application-fault procedure is in
-[`docs/spec-005-runbook.md`](docs/spec-005-runbook.md).
-
-List the Spec 005 experiment catalog and run a deterministic application-boundary scenario:
-
-```bash
-scripts/chaos list
-scripts/chaos run APP-01
-scripts/chaos run APP-02
-```
-
-Chaos mode is disabled by default and forbidden when `APP_ENVIRONMENT` is `production`.
-Resource controls additionally require an isolated Compose project named
-`job-visibility-chaos-*`.
-
-Inspect migration and pipeline state with:
-
-```bash
-.venv/bin/alembic -n scheduler current
-.venv/bin/alembic -n edr current
-curl -fsS http://localhost:8083/connectors/edr-jdbc-sink-v1/status
-docker compose exec cassandra cqlsh -u worker -p worker-local -e \
-  'SELECT * FROM worker_demo.datasets'
-```
-
-The normal unit suite never starts containers. Infrastructure tests are opt-in through the
-`integration`, `postgres`, `kafka`, `cassandra`, and `e2e` pytest markers. Stop the stack
-with `docker compose down`; use `docker compose down --volumes` only when intentionally
-discarding all local PostgreSQL, Kafka, and Cassandra data.
-
-## EDR lifecycle taxonomy
-
-Every canonical `eventType` is classified without requiring callers to duplicate metadata:
-
-- `edrType`: `SCHEDULING` for scheduler-control rows or `ATTEMPT` for execution rows.
-- `edrGroup`: `SCHEDULING`, `EXECUTION`, `RETRY`, or `TERMINAL`.
-- `requirement`: intermediate/configurable rows are `OPTIONAL`; terminal outcome rows are
-  `MANDATORY`.
-
-`GET /edr-lifecycle` returns the complete mapping. `POST /edrs` returns the classification
-applied to the accepted event, and serialized simulation input events include
-`edr_type`, `edr_group`, and `edr_requirement`.
-
-## Architecture assessment
-
-The following assessment uses the four 1–10 criteria from section 7.7 of
-[*Serverless Architectures on AWS*](https://learning.oreilly.com/library/view/serverless-architectures-on/9781617295423/OEBPS/Text/ch07.htm#sigil_toc_id_109):
-precision, scalability by number of open tasks, hotspot scalability, and cost. Higher
-scores are better.
-
-These scores apply to the current in-memory simulation, not the stronger PostgreSQL
-architecture proposed in the implementation plan. The scalability scores are provisional
-until they are supported by load tests.
-
-| Criterion | Score | Assessment |
-| --- | ---: | --- |
-| Precision | **5/10** | One-minute polling introduces 0–60 seconds of normal delay. The `X` batch limit and worker capacity can add further polling intervals during a backlog. |
-| Scalability—open tasks | **3/10** | Jobs are held in memory, and eligible items are scanned and sorted by a single process. The current implementation is a simulator rather than durable production infrastructure. |
-| Scalability—hotspots | **4/10** | Bounded batches protect the scheduler from immediate overload, but excess jobs become backlog. The global lock and single scheduler queue remain bottlenecks. |
-| Cost | **9/10** | The simulator is inexpensive to run because it requires only a Python process. Some of this advantage comes from not yet providing production durability and availability. |
-| **Total** | **21/40** | **5.25/10 average** |
-
-For context, the chapter's unweighted scores are:
-
-| Solution | Total |
-| --- | ---: |
-| Cron job | 25/40 |
-| DynamoDB TTL | 27/40 |
-| Step Functions | 23/40 |
-| SQS | 24/40 |
-| SQS + DynamoDB TTL | 32/40 |
-| **Current simulator scheduler** | **21/40** |
-
-### Precision and polling backlog
-
-If `X=100` and 401 jobs are already eligible, the last batch cannot be retrieved until
-approximately the fifth poll:
-
-```text
-polls required = ceil(401 / 100) = 5
-```
-
-With one-minute polling, some jobs therefore wait about four additional minutes even
-when the scheduler operates exactly as designed. The visibility projection explains this
-delay, but visibility alone cannot improve execution precision.
-
-### Production target
-
-Completing the persistence and horizontal-scaling work in the implementation plan should
-make the following scores realistic:
-
-| Criterion | Target |
-| --- | ---: |
-| Precision | **6–7** |
-| Scalability—open tasks | **8** |
-| Scalability—hotspots | **7–8** |
-| Cost | **7** |
-| **Total** | **28–30/40** |
-
-Reaching that target requires:
-
-- PostgreSQL persistence with an index on eligibility and schedule time.
-- Atomic job claims using `FOR UPDATE SKIP LOCKED`.
-- Multiple concurrent pollers.
-- Queue partitioning or sharding for large hotspots.
-- Separate worker queues and autoscaling.
-- Backpressure and backlog-age metrics.
-- Load tests with hundreds of thousands or millions of open jobs.
-- A shorter polling interval or event/timer-based wake-up when sub-minute precision matters.
-
-Visibility and explainability are the current implementation's strongest capabilities. It
-distinguishes acknowledgement, retrieval, polling backlog, worker delay, missing EDRs,
-retries, conflicts, and stale data. It observes and explains scheduler behavior; it does
-not yet provide production-grade scheduling scalability.
-
-## Spec 007: Vert.x Kafka pull worker
-
-The Java 21/Vert.x 5 implementation is in [vertx-pull-worker](vertx-pull-worker/README.md).
-Run `scripts/spec007 test` for unit and real-Kafka verification, `scripts/spec007 build` for
-the hardened image, and `scripts/spec007 baseline` for the ten-partition/five-worker local
-fleet. `scripts/spec007 capacity` exercises the 20,000/100,000 compressed Kafka profiles.
-See the [runbook](docs/spec-007-runbook.md) and [evidence](docs/spec-007-evidence.md) for
-routing migration, recovery, deployment and remaining production acceptance gates.
+See the [evidence report](docs/spec-007-evidence.md) for measured results and remaining gates,
+and the [runbook](docs/spec-007-runbook.md) for operations, migration, and rollback.
