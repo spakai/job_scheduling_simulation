@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Spec007ExecutionEdrV1",
+  "type": "object",
+  "required": ["eventType", "jobId"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "eventType": {"enum": ["ATTEMPT_STARTED", "ATTEMPT_FAILED", "JOB_COMPLETED", "TERMINAL", "DISPOSITION_COMPLETED", "EXPIRED"]},
+    "jobId": {"type": "string", "minLength": 1},
+    "attemptId": {"type": "string"},
+    "executionToken": {"type": "string"},
+    "requestHash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "leaseUntil": {"type": "integer"},
+    "expiresAt": {"type": "integer"},
+    "outcome": {"type": "object"}
+  },
+  "allOf": [
+    {"if": {"properties": {"eventType": {"const": "ATTEMPT_STARTED"}}}, "then": {"required": ["attemptId", "executionToken", "requestHash", "leaseUntil", "expiresAt"]}},
+    {"if": {"properties": {"eventType": {"const": "JOB_COMPLETED"}}}, "then": {"required": ["attemptId", "requestHash", "outcome", "expiresAt"]}}
+  ]
+}

@@ -1,0 +1,302 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rerate-worker
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rerate-workers
+spec:
+  clusterIP: None
+  selector: {app: rerate-worker}
+  ports: [{name: health, port: 8080}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rerate-worker
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  TOPIC_NAMESPACE: prod-
+  WORK_PARTITIONS: "10"
+  MAX_IN_FLIGHT_PER_POD: "10"
+  MAX_IN_FLIGHT_PER_PARTITION: "10"
+  HANDLER_URL: https://rerate-dependency/rerate
+  STATE_DIR: /state
+  KAFKA_PROPERTIES_FILE: /secrets/client.properties
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rerate-subscriber
+spec:
+  serviceName: rerate-workers
+  replicas: 5
+  selector:
+    matchLabels: {app: rerate-worker, fleet: subscriber}
+  template:
+    metadata:
+      labels: {app: rerate-worker, fleet: subscriber}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: rerate-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: spec007-worker:local
+          imagePullPolicy: IfNotPresent
+          ports: [{name: health, containerPort: 8080}]
+          envFrom: [{configMapRef: {name: rerate-worker}}]
+          env:
+            - name: WORKER_SLOT
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: WORKLOAD, value: "subscriber"}
+            - {name: RETRY_WORKER, value: "false"}
+            - {name: RATE_LIMIT_TPS, value: "2"}
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits: {cpu: "2", memory: "1Gi"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health/live, port: health}
+            periodSeconds: 10
+          startupProbe:
+            httpGet: {path: /health/live, port: health}
+            periodSeconds: 5
+            failureThreshold: 60
+          volumeMounts:
+            - {name: state, mountPath: /state}
+            - {name: tmp, mountPath: /tmp}
+            - {name: kafka-auth, mountPath: /secrets, readOnly: true}
+      volumes:
+        - name: state
+          emptyDir: {sizeLimit: 1Gi}
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+        - name: kafka-auth
+          secret: {secretName: rerate-kafka-client}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rerate-group
+spec:
+  serviceName: rerate-workers
+  replicas: 1
+  selector:
+    matchLabels: {app: rerate-worker, fleet: group}
+  template:
+    metadata:
+      labels: {app: rerate-worker, fleet: group}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: rerate-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: spec007-worker:local
+          imagePullPolicy: IfNotPresent
+          ports: [{name: health, containerPort: 8080}]
+          envFrom: [{configMapRef: {name: rerate-worker}}]
+          env:
+            - name: WORKER_SLOT
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: WORKLOAD, value: "group"}
+            - {name: RETRY_WORKER, value: "false"}
+            - {name: RATE_LIMIT_TPS, value: "0.5"}
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits: {cpu: "2", memory: "1Gi"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health/live, port: health}
+            periodSeconds: 10
+          startupProbe:
+            httpGet: {path: /health/live, port: health}
+            periodSeconds: 5
+            failureThreshold: 60
+          volumeMounts:
+            - {name: state, mountPath: /state}
+            - {name: tmp, mountPath: /tmp}
+            - {name: kafka-auth, mountPath: /secrets, readOnly: true}
+      volumes:
+        - name: state
+          emptyDir: {sizeLimit: 1Gi}
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+        - name: kafka-auth
+          secret: {secretName: rerate-kafka-client}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rerate-retry
+spec:
+  serviceName: rerate-workers
+  replicas: 0
+  selector:
+    matchLabels: {app: rerate-worker, fleet: retry}
+  template:
+    metadata:
+      labels: {app: rerate-worker, fleet: retry}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: rerate-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: spec007-worker:local
+          imagePullPolicy: IfNotPresent
+          ports: [{name: health, containerPort: 8080}]
+          envFrom: [{configMapRef: {name: rerate-worker}}]
+          env:
+            - name: WORKER_SLOT
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: WORKLOAD, value: "subscriber"}
+            - {name: RETRY_WORKER, value: "true"}
+            - {name: RATE_LIMIT_TPS, value: "0.25"}
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits: {cpu: "2", memory: "1Gi"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health/live, port: health}
+            periodSeconds: 10
+          startupProbe:
+            httpGet: {path: /health/live, port: health}
+            periodSeconds: 5
+            failureThreshold: 60
+          volumeMounts:
+            - {name: state, mountPath: /state}
+            - {name: tmp, mountPath: /tmp}
+            - {name: kafka-auth, mountPath: /secrets, readOnly: true}
+      volumes:
+        - name: state
+          emptyDir: {sizeLimit: 1Gi}
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+        - name: kafka-auth
+          secret: {secretName: rerate-kafka-client}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: rerate-subscriber}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: rerate-worker, fleet: subscriber}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rerate-group-retry
+spec:
+  serviceName: rerate-workers
+  replicas: 0
+  selector:
+    matchLabels: {app: rerate-worker, fleet: group-retry}
+  template:
+    metadata:
+      labels: {app: rerate-worker, fleet: group-retry}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: rerate-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: spec007-worker:local
+          imagePullPolicy: IfNotPresent
+          ports: [{name: health, containerPort: 8080}]
+          envFrom: [{configMapRef: {name: rerate-worker}}]
+          env:
+            - name: WORKER_SLOT
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: WORKLOAD, value: "group"}
+            - {name: RETRY_WORKER, value: "true"}
+            - {name: RATE_LIMIT_TPS, value: "0.25"}
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits: {cpu: "2", memory: "1Gi"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health/live, port: health}
+            periodSeconds: 10
+          startupProbe:
+            httpGet: {path: /health/live, port: health}
+            periodSeconds: 5
+            failureThreshold: 60
+          volumeMounts:
+            - {name: state, mountPath: /state}
+            - {name: tmp, mountPath: /tmp}
+            - {name: kafka-auth, mountPath: /secrets, readOnly: true}
+      volumes:
+        - name: state
+          emptyDir: {sizeLimit: 1Gi}
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+        - name: kafka-auth
+          secret: {secretName: rerate-kafka-client}

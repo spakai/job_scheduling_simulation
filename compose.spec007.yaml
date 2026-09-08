@@ -1,0 +1,108 @@
+# Run with compose.yaml. Isolated names keep the Spec 006 reference fleet separate.
+x-worker: &worker
+  image: spec007-worker:local
+  build: ./vertx-pull-worker
+  read_only: true
+  user: "10001:10001"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: ["/tmp:size=512m,mode=1777"]
+  mem_limit: 768m
+  cpus: 1.0
+  stop_grace_period: 90s
+  restart: on-failure
+  healthcheck:
+    test: [CMD, wget, -q, -O, /dev/null, http://localhost:8080/health/ready]
+    interval: 5s
+    timeout: 2s
+    retries: 20
+  depends_on:
+    kafka: {condition: service_healthy}
+    spec007-topics: {condition: service_completed_successfully}
+  environment: &environment
+    SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    TOPIC_NAMESPACE: v007-
+    HANDLER_URL: http://spec007-demo:8080/rerate
+    WORK_PARTITIONS: 10
+    WORKLOAD: subscriber
+    MAX_IN_FLIGHT_PER_POD: 10
+    MAX_IN_FLIGHT_PER_PARTITION: 10
+    RATE_LIMIT_TPS: 2
+    RATE_LIMIT_BURST: 2
+
+services:
+  spec007-topics:
+    image: spec007-worker:local
+    build: ./vertx-pull-worker
+    profiles: [spec007-smoke, spec007-baseline, spec007-group, spec007-retry, spec007-group-retry]
+    entrypoint: [java, -cp, /app/worker.jar, com.example.jobs.pull.Operations, topics]
+    environment: *environment
+    depends_on:
+      kafka: {condition: service_healthy}
+      schema-registry: {condition: service_healthy}
+  spec007-demo:
+    image: spec007-worker:local
+    profiles: [spec007-smoke, spec007-baseline, spec007-group]
+    entrypoint: [java, -cp, /app/worker.jar, com.example.jobs.pull.Operations, demo-handler]
+    environment:
+      DEMO_DELAY_MS: ${DEMO_DELAY_MS:-100}
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: [/tmp:size=32m]
+  spec007-subscriber-0:
+    <<: *worker
+    profiles: [spec007-smoke, spec007-baseline]
+    environment:
+      <<: *environment
+      WORKER_SLOT: subscriber-0
+  spec007-subscriber-1:
+    <<: *worker
+    profiles: [spec007-smoke, spec007-baseline]
+    environment:
+      <<: *environment
+      WORKER_SLOT: subscriber-1
+  spec007-subscriber-2:
+    <<: *worker
+    profiles: [spec007-baseline]
+    environment:
+      <<: *environment
+      WORKER_SLOT: subscriber-2
+  spec007-subscriber-3:
+    <<: *worker
+    profiles: [spec007-baseline]
+    environment:
+      <<: *environment
+      WORKER_SLOT: subscriber-3
+  spec007-subscriber-4:
+    <<: *worker
+    profiles: [spec007-baseline]
+    environment:
+      <<: *environment
+      WORKER_SLOT: subscriber-4
+  spec007-group-0:
+    <<: *worker
+    profiles: [spec007-group]
+    environment:
+      <<: *environment
+      WORKLOAD: group
+      WORKER_SLOT: group-0
+      RATE_LIMIT_TPS: 0.5
+  spec007-retry-0:
+    <<: *worker
+    profiles: [spec007-retry]
+    environment:
+      <<: *environment
+      RETRY_WORKER: "true"
+      WORKER_SLOT: retry-0
+      RATE_LIMIT_TPS: 0.25
+
+  spec007-group-retry-0:
+    <<: *worker
+    profiles: [spec007-group-retry]
+    environment:
+      <<: *environment
+      WORKLOAD: group
+      RETRY_WORKER: "true"
+      WORKER_SLOT: group-retry-0
+      RATE_LIMIT_TPS: 0.25

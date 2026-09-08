@@ -1,12 +1,33 @@
 # Vert.x Kafka Pull Worker Implementation Plan
 
-Status: proposed
+Status: runtime and deployment implemented locally; production release gates remain explicit
 
 Implements: [`spec.md`](spec.md)
 
 Architecture: [`arc42.md`](arc42.md)
 
-Depends on: completed Spec 006 Kafka contracts and Dockerized reference worker
+Depends on: Spec 006 Kafka contracts and Dockerized reference worker
+
+## Local implementation progress
+
+The [`vertx-pull-worker`](../../vertx-pull-worker/README.md) module implements Java 21/Vert.x 5
+consumption, concurrent partition lanes, owner FIFO, bounded windows, exact-prefix transactions,
+partition-fenced EDR writers, disk-backed restoration, completed-request suppression, internal
+retry, durable failure disposition, isolated retry requeue, adaptive fractional TPS, HTTP and
+blocking handler adapters, supervision, health, metrics and tracing.
+
+Compose supplies the five-worker/ten-partition subscriber baseline and isolated group/retry
+profiles. Kubernetes templates, schemas, alerts, migration checks, pure producer-route
+translation, CI and executable unit/Kafka/capacity tests are included. The Python reference
+runtime is retained for migration and comparison.
+
+See [`docs/spec-007-evidence.md`](../../docs/spec-007-evidence.md) for measured local results
+and coverage limits. Compressed Kafka capacity tests do not prove 60–180-second dependency
+capacity or production SLOs. Multi-broker chaos, environment security review and actual
+production migration/retirement remain release gates; local tooling does not perform cutover.
+
+The phase tasks below are the governing delivery checklist, not a claim that every
+production acceptance gate has been approved.
 
 ## Contents
 

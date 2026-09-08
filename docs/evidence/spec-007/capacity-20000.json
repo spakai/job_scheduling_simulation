@@ -1,0 +1,13 @@
+{
+  "requests" : 20000,
+  "partitions" : 10,
+  "workers" : 5,
+  "slotsPerWorker" : 10,
+  "handlerMs" : 1,
+  "seconds" : 104.648306834,
+  "jobsPerSecond" : 191.1163267239986,
+  "peakBusinessConcurrency" : 4,
+  "ownerOverlap" : 0,
+  "readCommittedResults" : 20000,
+  "productionSloProof" : false
+}

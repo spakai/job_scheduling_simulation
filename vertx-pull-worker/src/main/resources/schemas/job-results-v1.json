@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job-results-v1",
+  "title": "JobResultV1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schemaVersion", "jobId", "ownerId", "correlationId", "attempt", "status", "completedAt"],
+  "properties": {
+    "schemaVersion": {"type": "integer", "const": 1},
+    "jobId": {"type": "string", "minLength": 1},
+    "ownerId": {"type": "string", "minLength": 1},
+    "correlationId": {"type": "string", "minLength": 1},
+    "attempt": {"type": "integer", "minimum": 1},
+    "status": {"type": "string", "enum": ["SUCCEEDED", "FAILED", "RETRIES_EXHAUSTED"]},
+    "completedAt": {"type": "string", "format": "date-time"}
+  }
+}

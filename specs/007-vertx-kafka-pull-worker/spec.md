@@ -1,6 +1,6 @@
 # Vert.x Kafka Pull Worker Specification
 
-Status: proposed
+Status: implemented locally; production acceptance gates remain open
 
 Supersedes: the Python pull-worker runtime and concurrency model in Spec 006
 

@@ -264,3 +264,12 @@ Visibility and explainability are the current implementation's strongest capabil
 distinguishes acknowledgement, retrieval, polling backlog, worker delay, missing EDRs,
 retries, conflicts, and stale data. It observes and explains scheduler behavior; it does
 not yet provide production-grade scheduling scalability.
+
+## Spec 007: Vert.x Kafka pull worker
+
+The Java 21/Vert.x 5 implementation is in [vertx-pull-worker](vertx-pull-worker/README.md).
+Run `scripts/spec007 test` for unit and real-Kafka verification, `scripts/spec007 build` for
+the hardened image, and `scripts/spec007 baseline` for the ten-partition/five-worker local
+fleet. `scripts/spec007 capacity` exercises the 20,000/100,000 compressed Kafka profiles.
+See the [runbook](docs/spec-007-runbook.md) and [evidence](docs/spec-007-evidence.md) for
+routing migration, recovery, deployment and remaining production acceptance gates.
