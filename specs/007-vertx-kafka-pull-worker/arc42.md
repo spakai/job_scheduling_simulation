@@ -1,14 +1,19 @@
 # Vert.x Kafka Pull Worker Architecture
 
-Status: proposed for review
+Status: implemented locally; production acceptance and cutover remain open
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 Governing specification: [`spec.md`](spec.md)
 
-This arc42 document is the target production architecture for the Kafka pull worker. It
-supersedes the Python worker architecture in Spec 006 while retaining Spec 006 topic and
-compatible envelope fields; topic/key migration is explicit in Spec 007 section 14.
+This arc42 document governs the implemented Java pull worker. It supersedes the Python
+worker architecture in Spec 006 while preserving compatible request envelope fields.
+Work topics and keys change explicitly; Spec 007 section 14 governs migration. The Python
+reference remains available, and production replacement has not been performed.
+
+The implementation is in [vertx-pull-worker](../../vertx-pull-worker/README.md); local results
+and unapproved release gates are in the [evidence report](../../docs/spec-007-evidence.md).
+Architectural requirements below remain the target for production acceptance.
 
 ## Contents
 
@@ -141,12 +146,12 @@ are migration/reference systems, not production peers after cutover.
 | workload-scoped execution-state topics | Internal | Transactional, compacted | Completed duplicate authority. |
 | `/health/live`, `/health/ready`, `/metrics` | Outbound | Near real time | Platform and operator status. |
 
-### 3.4 Rerating topology and capacity baseline
+### 3.4 Workload topology and capacity baseline
 
 Use `subscriber-rerate` keyed by `subscriberId` with 10 partitions and 5 subscriber pods,
 each with one work-consumer verticle and 10 shared asynchronous execution slots. Kafka
 assigns approximately two partitions per pod; partition coordinators are local state, not
-consumer verticles. Use `subscribe`, not manual work assignment. Group rerating uses its own
+consumer verticles. Use `subscribe`, not manual work assignment. Group processing uses its own
 topic/key, group, deployment, pool and limiter. Another group on the subscriber topic would
 receive all subscriber records and is not workload isolation.
 
@@ -157,7 +162,7 @@ starts/s, while 50 long-running slots usually constrain sustained throughput fir
 
 ## 4. Solution Strategy
 
-1. Keep compatible envelope fields while explicitly migrating topic/key routing to isolated rerating workloads.
+1. Keep compatible envelope fields while explicitly migrating topic/key routing to isolated workloads.
 2. Replace the production Python worker with one Vert.x service per pod.
 3. Confine Kafka consumer control and mutable lane state to Vert.x contexts.
 4. Register each record in an ordered tracker identified by topic and partition.
@@ -224,6 +229,31 @@ flowchart LR
     tx --> telemetry
     state --> telemetry
 ```
+
+### Implementation map
+
+The diagrams describe logical responsibilities. Several controller responsibilities share
+one context-confined runtime rather than separate classes:
+
+| Responsibility | Implemented source under `vertx-pull-worker/src/main/java/com/example/jobs/pull/` |
+| --- | --- |
+| Lifecycle and health | `Main`, `WorkerVerticle` |
+| Fleet configuration | `config/RuntimeConfig`, `config/WorkerConfig` |
+| Consumer, routing, restore, retry requeue, supervision | `runtime/PullRuntime` |
+| Native assignment fencing and metadata | `kafka/MetadataConsumer` |
+| Owner FIFO and contiguous completion | `lane/PartitionLane`, `lane/ContiguousCompletionTracker` |
+| Source-prefix and partition EDR transactions | `kafka/TransactionAdapter` |
+| Restored durable materialization | `ledger/LedgerStore` |
+| Handler capacity and adaptive TPS | `execution/CapacityGate`, `execution/TokenBucket`, `execution/AdaptiveAdmission` |
+| HTTP/blocking execution | `execution/HttpBusinessHandler`, `execution/BlockingBusinessHandler` |
+| Contracts and migration tooling | `contract/Job`, `contract/RouteMigration`, `kafka/MigrationGuard`, `Operations` |
+| Metrics and traces | `runtime/Telemetry`, runtime/transaction metrics |
+
+`ATTEMPT_STARTED` is durable before invocation. `JOB_COMPLETED` preserves successful work;
+`DISPOSITION_COMPLETED` preserves the exact result/lifecycle/retry/DLQ outputs for a resolved
+failed logical attempt. Both can be reconstructed behind an uncommitted source gap.
+TPS admission precedes lease creation, and a circuit permit identifies its generation so
+an older callback cannot resolve a later half-open probe.
 
 ### 5.3 Component responsibilities
 

@@ -52,7 +52,7 @@ partition, preserving same-owner FIFO and keeping partition counts low. The impl
 transactions, provide exact manual-offset semantics, add completed-request deduplication,
 and run as a hardened Docker container.
 
-### Alignment with offline rerating notes
+### Alignment with offline workload notes
 
 The governing details are Spec 007 sections 3.1, 7.1–7.2, 8.2, and 14. Deliver:
 
@@ -169,8 +169,7 @@ vertx-pull-worker/
     integration/
     chaos/
 infra/kafka/schemas/
-  rerating-attempt-edr-v1.json
-  rerating-execution-state-v1.json
+   workload attempt and execution-state EDR schemas
 compose.yaml
 docs/
   spec-007-runbook.md
@@ -278,7 +277,7 @@ Exit criteria:
 Tasks:
 
 1. Define `Handler` as a non-blocking `Future<Outcome>` contract.
-2. Port reference handlers/outcomes and add 60–180 second rerating load fixtures.
+2. Port reference handlers/outcomes and add 60–180 second workload load fixtures.
 3. Add a named bounded `WorkerExecutor` adapter for blocking handlers with `ordered=false`.
 4. Add separate handler permits and uncommitted-window accounting; completion releases only handler capacity.
 5. Port the virtual-clock-testable per-pod token bucket using Vert.x timers in production.

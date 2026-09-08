@@ -111,8 +111,8 @@ No scheduler database, due-job query, database claim, or scheduler outbox is int
 
 | Workload | Work topic / key | Deployment |
 | --- | --- | --- |
-| Subscriber rerating | `subscriber-rerate` / canonical `subscriberId` | Initially 10 partitions, 5 pods, 10 active handler slots per pod. |
-| Slow group rerating | `group-rerate` / canonical `groupId` | Separate consumer group, pods, worker pool, TPS/circuit settings, and capacity budget. |
+| Subscriber processing | `subscriber-rerate` / canonical `subscriberId` | Initially 10 partitions, 5 pods, 10 active handler slots per pod. |
+| Slow group processing | `group-rerate` / canonical `groupId` | Separate consumer group, pods, worker pool, TPS/circuit settings, and capacity budget. |
 | Retry processing | Workload-specific retry topic / original entity ID | Separate consumer group/deployment and limiter; normally may be scaled to zero. |
 
 Deploy exactly one dedicated work-consumer verticle per pod; use `subscribe`, letting the

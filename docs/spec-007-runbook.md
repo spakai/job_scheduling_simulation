@@ -8,7 +8,7 @@ Run `scripts/spec007 build` and `scripts/spec007 smoke` for two non-root workers
 explicit demo HTTP dependency. `scripts/spec007 produce 100` publishes requests using raw
 entity keys. `scripts/spec007 baseline` starts the five-slot subscriber fleet on the same
 10 partitions. Do not run smoke and baseline as separate deployments: they share slot IDs.
-The demo dependency returns synthetic results; it is not a business rerating implementation.
+The demo dependency returns synthetic results; it is not a production business implementation.
 
 Inspect `/health/live`, `/health/ready`, and `/metrics` inside a worker container. Prometheus
 includes JVM/Vert.x Micrometer metrics and `vtx_*` lane/admission counters. Optional tracing
