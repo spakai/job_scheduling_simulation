@@ -77,6 +77,46 @@ Raw reports: [20,000](evidence/spec-007/capacity-20000.json) and
 **not** production SLO proof, five-container load measurements, or evidence for real
 60–180-second dependency calls. The separate Compose smoke check exercises five containers.
 
+## Realistic business workload profile
+
+The production workload is materially different from the compressed capacity profile above.
+After a request is polled, processing may take approximately 1–5 minutes because the handler
+calls multiple external services and processes roughly one month of records. A single request
+may represent approximately 1,000–100,000 records. This profile is a workload assumption from
+the operating scenario, not a completed measurement in this repository.
+
+The next performance test must therefore use representative external-service stubs or a
+controlled test environment with realistic latency, fan-out, response sizes, failures, and
+rate limits. It must measure end-to-end completion time and percentiles, not only Kafka drain
+rate, across at least these cases:
+
+- 1,000, 10,000, and 100,000 records per request;
+- one request, concurrent requests, and burst arrivals;
+- external-service latency and failure distributions that produce 1–5 minute completion;
+- owner skew and overlapping owners;
+- configured pod/partition concurrency and TPS limits; and
+- restart, retry, timeout, and idempotency behavior while work is in flight.
+
+For orientation, processing 100,000 records in 1–5 minutes requires an average record rate of
+approximately 333–1,667 records/second if the records are processed continuously. That rate
+does not determine worker capacity by itself: external-service latency, fan-out, concurrency,
+and service quotas are the controlling inputs.
+
+The focused integration test `realHttpWorkloadTakesOneMinuteThen503BackpressureReducesTps`
+now covers the first realistic slice. It ran in **62.66 seconds** against the production
+`HttpBusinessHandler` and a real local HTTP server: two concurrent requests completed after a
+60-second dependency delay, then four requests received `503` responses. All six source records
+advanced safely, four `ATTEMPT_FAILED`/`DISPOSITION_COMPLETED` outcomes were durable, and the
+pod admission rate reduced from `2 TPS` to `0.5 TPS`. The stub accounts for three external
+service stages per request so the test records 18 stage calls overall; those stages are still
+modeled within one local endpoint and must be replaced by separate service stubs for a full
+fan-out benchmark.
+
+The focused `AdaptiveAdmissionTest` also passes all three tests. With a healthy rate of `2 TPS`
+and two-sample adaptive windows, it verifies the progression `2.0 -> 1.0 -> 0.5 -> 0.0 TPS`,
+the half-open probe after cooldown, successful recovery to `0.5 TPS`, and administrative
+`RATE_LIMIT_TPS=0`, which remains stopped and does not probe.
+
 ## Actual container kill
 
 The final five-container baseline published 100 synthetic requests and SIGKILLed subscriber

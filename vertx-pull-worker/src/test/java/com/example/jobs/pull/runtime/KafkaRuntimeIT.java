@@ -3,7 +3,9 @@ package com.example.jobs.pull.runtime;
 import static org.junit.jupiter.api.Assertions.*;
 import com.example.jobs.pull.config.*;
 import com.example.jobs.pull.execution.BusinessHandler;
+import com.example.jobs.pull.execution.HttpBusinessHandler;
 import io.vertx.core.*;
+import io.vertx.core.http.HttpServer;
 import io.vertx.core.json.JsonObject;
 import java.time.Duration;
 import java.time.Instant;
@@ -30,6 +32,8 @@ class KafkaRuntimeIT {
   RuntimeConfig config;
   Map<String,String> settings;
   PullRuntime runtime;
+  HttpServer dependency;
+  HttpBusinessHandler httpHandler;
   final BlockingQueue<Throwable> faults = new LinkedBlockingQueue<>();
   final Map<String,Promise<JsonObject>> barriers = new ConcurrentHashMap<>();
   final List<String> starts = new CopyOnWriteArrayList<>();
@@ -84,7 +88,10 @@ class KafkaRuntimeIT {
   }
   interface Check { boolean get() throws Exception; }
   void until(Check check) throws Exception {
-    long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(40);
+    until(check,40);
+  }
+  void until(Check check,long timeoutSeconds) throws Exception {
+    long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(timeoutSeconds);
     while(!check.get()) {
       if(!faults.isEmpty()) throw new AssertionError("Runtime fault",faults.peek());
       if(System.nanoTime()>deadline) fail("Condition deadline; starts="+starts+" metrics="+context(runtime::metrics));
@@ -117,7 +124,45 @@ class KafkaRuntimeIT {
     }
   }
   @AfterEach void close() throws Exception {
-    if(runtime!=null) await(context(runtime::close)); await(vertx.close());
+    if(runtime!=null) await(context(runtime::close));
+    if(httpHandler!=null) await(httpHandler.close());
+    if(dependency!=null) await(dependency.close());
+    await(vertx.close());
+  }
+
+  @Test void realHttpWorkloadTakesOneMinuteThen503BackpressureReducesTps() throws Exception {
+    settings.put("RATE_LIMIT_TPS","2"); settings.put("RATE_LIMIT_BURST","2");
+    settings.put("ADAPTIVE_MIN_SAMPLES","2"); settings.put("ADAPTIVE_COOLDOWN_MS","1000");
+    settings.put("HANDLER_TIMEOUT_MS","70000"); settings.put("ATTEMPT_LEASE_MS","110000");
+    AtomicInteger dependencyCalls=new AtomicInteger();
+    java.util.concurrent.atomic.AtomicBoolean unavailable=new java.util.concurrent.atomic.AtomicBoolean();
+    dependency=await(vertx.createHttpServer().requestHandler(request -> {
+      // One request represents a fan-out across three external service stages.
+      dependencyCalls.addAndGet(3);
+      if(unavailable.get()) { request.response().setStatusCode(503).end(); return; }
+      vertx.setTimer(60_000,id -> {
+        if(!request.response().ended()) request.response().end(new JsonObject().put("processed",true).encode());
+      });
+    }).listen(0,"127.0.0.1"));
+    settings.put("HANDLER_URL","http://127.0.0.1:"+dependency.actualPort()+"/process");
+    config=RuntimeConfig.fromEnvironment(settings);
+    httpHandler=new HttpBusinessHandler(vertx,settings.get("HANDLER_URL"),config.handlerTimeoutMs(),config.maxRecordBytes());
+    start(httpHandler);
+
+    publish("slow-1","owner-1"); publish("slow-2","owner-2");
+    until(() -> dependencyCalls.get()==6,10);
+    until(() -> committed()==2,75);
+    assertEquals(6,dependencyCalls.get());
+    assertTrue(context(runtime::metrics).contains("vtx_effective_tps 2.0"));
+
+    unavailable.set(true);
+    for(int i=0;i<4;i++) publish("unavailable-"+i,"owner-"+(i+3));
+    until(() -> dependencyCalls.get()>=18,15);
+    until(() -> committed()==6,30);
+    assertEquals(18,dependencyCalls.get());
+    assertTrue(context(runtime::metrics).contains("vtx_effective_tps 0.5"));
+    assertEquals(4,read(config.topic("edr")).stream().filter(r -> r.value().contains("ATTEMPT_FAILED")).count());
+    assertTrue(faults.isEmpty());
   }
   @Test void completedBehindGapRestoresWithoutBusinessReplayAndOwnerWaitsForCommit() throws Exception {
     start((job,attempt) -> { starts.add(job.id()); calls.incrementAndGet(); var p=Promise.<JsonObject>promise(); barriers.put(job.id(),p); return p.future(); });
