@@ -16,6 +16,7 @@ capacity, security, and acceptance gates remain open.
 - [Spec 007 arc42 architecture](specs/007-vertx-kafka-pull-worker/arc42.md)
 - [Spec 007 runbook](docs/spec-007-runbook.md)
 - [Spec 007 evidence](docs/spec-007-evidence.md)
+- [Spec 007 chaos plan](docs/chaos.md#spec-007-chaos-plan)
 - [Root architecture overview](architecture.md)
 
 ## Architecture at a glance
@@ -91,3 +92,26 @@ throughput or availability.
 
 See the [evidence report](docs/spec-007-evidence.md) for measured results and remaining gates,
 and the [runbook](docs/spec-007-runbook.md) for operations, migration, and rollback.
+
+### Engineering-readiness comparison
+
+Using the same 100-point engineering-readiness framing as the current Specs 001-004
+assessment, Spec 007 is provisionally **88/100**. This is a local evidence score, not a
+production release approval.
+
+| Area | Score | Basis |
+| --- | ---: | --- |
+| Correctness and ordering | 25/25 | Contiguous source prefixes, owner FIFO, durable EDRs, deduplication, retry/DLQ and workload isolation are covered by unit and real-Kafka tests. |
+| Recovery and rebalancing | 18/20 | Assignment epochs, fencing, ledger restoration, transaction ambiguity and worker-kill recovery are tested; multi-broker and repeated production-scale rebalances remain. |
+| Capacity and performance | 13/20 | 20,000/100,000 compressed Kafka runs pass, but realistic 60-180 second dependency calls, burst SLOs and fleet TPS measurements remain. |
+| Operations and observability | 14/15 | Health/readiness, metrics, tracing, bounded drain, pause/resume and a documented chaos matrix are implemented. |
+| Security and deployment | 10/15 | Non-root image, read-only root, bounded state and ACL guidance exist; production identity, ACL, multi-broker and environment review remain. |
+| Migration and external effects | 8/10 | Routing/migration checks and stable `jobId` idempotency headers exist; a durable external-effect idempotency proof is still required. |
+| **Total** | **88/100** | **Strong local implementation evidence; production gates remain open.** |
+
+The score is higher than the 86/100 assessment for Specs 001-004 because Spec 007 has
+broader executable coverage for offset safety, rebalancing, fencing, durable completion,
+backpressure and Kafka transaction recovery. It is not a claim of exactly-once arbitrary
+external effects: the dependency must durably enforce `Idempotency-Key: jobId`, and that
+property still needs a dedicated chaos test. See the [chaos plan](docs/chaos.md#spec-007-chaos-plan)
+and [remaining acceptance gates](docs/spec-007-evidence.md#remaining-production-acceptance).
