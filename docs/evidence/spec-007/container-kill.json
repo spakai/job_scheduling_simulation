@@ -1,0 +1,9 @@
+{
+  "runId": "aa47d0d9-e69b-44ba-af90-e48b6ce3a609",
+  "published": 100,
+  "seconds": 1.513133172,
+  "readCommittedResults": 100,
+  "killedContainer": "7541b3b7f89b6743778ed0ab8e67690d4df5239bcb1083e944f49508c3c70a7f",
+  "recoverySeconds": 244.49318021199997,
+  "externalSideEffectProof": false
+}

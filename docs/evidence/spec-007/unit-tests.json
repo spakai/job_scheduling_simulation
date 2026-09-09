@@ -1,0 +1,99 @@
+{
+  "date": "2026-09-08",
+  "suites": [
+    {
+      "name": "com.example.jobs.pull.ArchitectureFitnessTest",
+      "tests": "1",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.019"
+    },
+    {
+      "name": "com.example.jobs.pull.WorkerBootstrapTest",
+      "tests": "2",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "1.261"
+    },
+    {
+      "name": "com.example.jobs.pull.contract.JobTest",
+      "tests": "3",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.027"
+    },
+    {
+      "name": "com.example.jobs.pull.contract.RouteMigrationTest",
+      "tests": "1",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.017"
+    },
+    {
+      "name": "com.example.jobs.pull.execution.AdaptiveAdmissionTest",
+      "tests": "3",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.014"
+    },
+    {
+      "name": "com.example.jobs.pull.execution.TokenBucketTest",
+      "tests": "2",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.007"
+    },
+    {
+      "name": "com.example.jobs.pull.kafka.TransactionAdapterTest",
+      "tests": "3",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.113"
+    },
+    {
+      "name": "com.example.jobs.pull.lane.CapacityProfileTest",
+      "tests": "1",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.712"
+    },
+    {
+      "name": "com.example.jobs.pull.lane.ContiguousCompletionTrackerTest",
+      "tests": "6",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.04"
+    },
+    {
+      "name": "com.example.jobs.pull.lane.PartitionLaneTest",
+      "tests": "6",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.134"
+    },
+    {
+      "name": "com.example.jobs.pull.ledger.LedgerStoreTest",
+      "tests": "1",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "0.068"
+    }
+  ],
+  "totals": {
+    "tests": 29,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  }
+}

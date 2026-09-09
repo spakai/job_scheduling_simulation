@@ -1,0 +1,31 @@
+groups:
+  - name: spec007
+    rules:
+      - alert: RerateEventLoopDelay
+        expr: vtx_event_loop_delay_seconds > 0.1
+        for: 2m
+        labels: {severity: warning}
+        annotations: {summary: "Rerate event loop is delayed; inspect blocking work and CPU pressure"}
+      - alert: RerateRecoveryLoop
+        expr: increase(vtx_recovery_required_total[5m]) > 2
+        labels: {severity: critical}
+        annotations: {summary: "Repeated fenced recovery; inspect Kafka and state disk"}
+      - alert: RerateDependencyOpen
+        expr: vtx_effective_tps == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "No ordinary starts; inspect administrative TPS and dependency circuit"}
+      - alert: RerateTrackingWindow
+        expr: vtx_tracking_records >= 80
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Tracking window stalled; inspect earliest gap and owner skew"}
+      - alert: RerateDlqGrowth
+        expr: increase(vtx_dlq_total[5m]) > 0
+        labels: {severity: warning}
+        annotations: {summary: "Rerate DLQ requires review; never automatically replay terminal records"}
+      - alert: RerateNoConsumers
+        expr: sum(vtx_assigned_partitions) == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: "No assigned rerate consumers"}

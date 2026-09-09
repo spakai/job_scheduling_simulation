@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+case "${1:-test}" in
+  test) docker compose up -d --wait kafka; mvn -B -f vertx-pull-worker/pom.xml clean verify -Pkafka ;;
+  chaos) .venv/bin/python scripts/spec007-chaos.py ;;
+  capacity) docker compose up -d --wait kafka; mvn -B -f vertx-pull-worker/pom.xml verify -Pkafka,capacity -Dit.test=KafkaCapacityIT "-Dspec007.capacity.counts=${2:-20000,100000}" ;;
+  build) docker build -t spec007-worker:local vertx-pull-worker ;;
+  smoke) docker compose -f compose.yaml -f compose.spec007.yaml --profile spec007-smoke up -d spec007-subscriber-0 spec007-subscriber-1 spec007-demo ;;
+  baseline) docker compose -f compose.yaml -f compose.spec007.yaml --profile spec007-baseline up -d spec007-subscriber-0 spec007-subscriber-1 spec007-subscriber-2 spec007-subscriber-3 spec007-subscriber-4 spec007-demo ;;
+  produce) docker compose -f compose.yaml -f compose.spec007.yaml exec -T spec007-subscriber-0 java -cp /app/worker.jar com.example.jobs.pull.Operations produce "${2:-100}" ;;
+  *) echo 'Usage: scripts/spec007 test|chaos|capacity [20000,100000]|build|smoke|baseline|produce [count]' >&2; exit 2 ;;
+esac

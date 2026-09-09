@@ -1,0 +1,27 @@
+{
+  "date": "2026-09-08",
+  "suites": [
+    {
+      "name": "com.example.jobs.pull.runtime.KafkaRuntimeIT",
+      "tests": "13",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "173.996"
+    },
+    {
+      "name": "com.example.jobs.pull.runtime.KafkaTransactionIT",
+      "tests": "3",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "7.915"
+    }
+  ],
+  "totals": {
+    "tests": 16,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  }
+}
