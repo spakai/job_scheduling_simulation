@@ -5,6 +5,120 @@ durable architecture contains each failure. It also records defects discovered w
 the local stack, because those defects are useful evidence: the tests changed implementation
 assumptions before they became production incidents.
 
+## Spec 007 worker recovery
+
+The scenarios below describe the PostgreSQL/Connect visibility path. The database-free
+Vert.x worker has a separate [runbook](spec-007-runbook.md) and
+[evidence report](spec-007-evidence.md). Its recovery authority is the Kafka execution ledger
+and broker-committed source offset.
+
+Use `scripts/spec007 test` for broker-backed EDR/prefix failure, lease, fencing, execution
+loss and isolation tests. After building and starting the five-worker baseline,
+`scripts/spec007 chaos` publishes 100 synthetic requests, kills subscriber slot 0 and
+verifies all results through `read_committed`; it requires the repository Python virtualenv.
+
+The recorded container-kill run recovered all 100 results in 244.49 seconds, including a
+wait for a live 240-second attempt lease. This is expected lease reconciliation. It does
+not prove exactly-once arbitrary external effects. Multi-broker/network and production
+dependency chaos remain acceptance gates.
+
+## Spec 007 chaos plan
+
+This plan validates the Kafka-first recovery boundaries of the Vert.x pull worker. The
+worker's durable authorities are the broker-committed source offset and the workload-scoped
+Kafka execution ledger. A local file, in-memory lane, HTTP response, or health endpoint is
+not evidence that a job was safely completed.
+
+### Scope and test topology
+
+Run the scenarios against a disposable environment with:
+
+- one subscriber topic with 10 partitions and at least two consumer pods;
+- one isolated group workload and, where relevant, one retry deployment;
+- `enable.auto.commit=false` and `isolation.level=read_committed`;
+- a controllable business dependency that delays, fails, drops responses, and records
+  `jobId` idempotency keys without applying the same key twice;
+- broker, consumer-group, transaction, worker, and dependency telemetry retained for the
+  complete recovery window; and
+- unique topic, group, transactional-ID, and state-volume names for every run.
+
+Use a small two-pod profile for fast checks and the five-pod/ten-partition profile for
+capacity and rebalance evidence. Do not treat the synthetic handler used by local smoke
+tests as proof of external side-effect safety.
+
+### Scenario matrix
+
+| ID | Fault injection | Expected containment and recovery | Required evidence |
+| --- | --- | --- | --- |
+| `VTX-CHAOS-01` | Kill one worker while it owns active records. | Kafka reassigns its partitions; the replacement fences the old slot, restores the ledger, and becomes ready. Uncommitted records redeliver. | Assignment/revocation timeline, old/new member IDs, broker offsets, ledger restore end, all expected outcomes. |
+| `VTX-CHAOS-02` | Kill a worker after the external call but before `JOB_COMPLETED`. | The call may repeat; the same `jobId` prevents a second physical effect. The source offset advances only after a durable completion or disposition. | Dependency idempotency log, attempt EDRs, source offset, output count, duplicate-effect count. |
+| `VTX-CHAOS-03` | Kill a worker after `JOB_COMPLETED` but before the prefix transaction. | The replacement reconstructs the completed outcome from the ledger and commits outputs without invoking the dependency again. | Ledger event/state, no second handler call, output records, committed next offset. |
+| `VTX-CHAOS-04` | Revoke a partition while its handler is delayed. | The old lane epoch is invalidated; late completion cannot write outputs or offsets. The new owner restores and redelivers from the authoritative offset. | Revoke/assign timestamps, epoch rejection, producer fencing result, redelivery and final outcome. |
+| `VTX-CHAOS-05` | Force a transaction timeout or broker failure during prefix commit. | The transaction aborts or is resolved by broker inspection; dispatch pauses and no offset is assumed committed from the client timeout. | Transaction state, broker offset before/after, read-committed outputs, recovery decision, no regressing commit. |
+| `VTX-CHAOS-06` | Stop Kafka while records are fetched and while records are waiting to commit. | Existing durable work remains in Kafka; the worker pauses or fails closed, then resumes after broker recovery without committing past a gap. | Consumer error, pause/readiness transitions, lag, committed offsets, output and ledger counts. |
+| `VTX-CHAOS-07` | Drop or delay consumer and producer traffic independently. | Bounded timeouts trigger recovery; no unbounded event-loop blocking or transaction queue growth occurs. | Network fault window, event-loop delay, queue depth, readiness, transaction and consumer metrics. |
+| `VTX-CHAOS-08` | Make the dependency return timeouts, 429s, 503s, and slow responses. | Adaptive admission steps down to 1, 0.5, then 0 TPS; retries are bounded and reacquire capacity; exhausted work is handed to retry/DLQ transactionally. | Per-pod starts, adaptive state transitions, retry attempts, lease state, retry/DLQ records, no excess starts. |
+| `VTX-CHAOS-09` | Exhaust per-partition and pod tracking windows with a slow earliest record. | Later owners may finish but remain behind the gap; the affected partition/pod pauses at high watermarks and resumes below low watermarks. | Window records/bytes, paused partitions, oldest age, committed offset unchanged across the gap. |
+| `VTX-CHAOS-10` | Fill the transaction adapter queue or make Kafka output slow. | The bounded queue backpressures lanes; no unbounded memory growth or offset advancement occurs. | Queue depth, heap/container memory, pause reason, transaction latency and final prefix. |
+| `VTX-CHAOS-11` | Exhaust the worker state volume during ledger restore or EDR writes. | Readiness stays false or the runtime is replaced; Kafka remains the recovery authority. Deleting local state does not lose completed work. | Disk usage, failure reason, replacement lifecycle, restore from Kafka, unchanged ledger authority. |
+| `VTX-CHAOS-12` | Restart the worker during ledger restoration. | The partial local restore is discarded or rebuilt safely; the partition is not advertised ready until its captured end is restored. | Restore start/end offsets, readiness probe history, assignment epoch, no pre-restore dispatch. |
+| `VTX-CHAOS-13` | Start a second process with the same stable worker slot. | Kafka transactional IDs fence the predecessor or reject the duplicate; two live slot owners never commit concurrently. | Transaction fencing error, group membership, producer IDs, exactly one accepted writer. |
+| `VTX-CHAOS-14` | Start subscriber and group traffic together, then fail one dependency. | Separate topics, groups, pods, limiters, ledgers, and retry paths isolate the workloads. One fleet's outage does not consume the other's capacity. | Group membership, topic lag, per-fleet starts, output/ledger separation and unaffected workload results. |
+| `VTX-CHAOS-15` | Stop the retry deployment while quarantine records accumulate. | Original workers remain unaffected; retry offsets and handoffs remain durable. Restarting retry requeues valid records atomically and never invokes business logic itself. | Retry lag, handoff identity, original-topic key/metadata, source and retry offsets. |
+| `VTX-CHAOS-16` | Gracefully terminate a pod during active work. | Readiness falls first, partitions pause, the bounded drain runs, unfinished work remains uncommitted, and the process exits within termination grace. | Probe transitions, drain duration, termination exit, offsets before/after, redelivery results. |
+
+### Execution order
+
+Run the scenarios in increasing blast radius:
+
+1. Execute `VTX-CHAOS-01` through `VTX-CHAOS-04` with one partition and deterministic
+  handler delays to establish ownership, epoch, and deduplication behavior.
+2. Execute `VTX-CHAOS-05` through `VTX-CHAOS-07` with broker and network faults. Repeat each
+  case at least three times because a timeout may resolve as either committed or aborted.
+3. Execute `VTX-CHAOS-08` through `VTX-CHAOS-12` with slow, failing, and resource-limited
+  dependencies. Record both the first failure and the recovery plateau.
+4. Execute `VTX-CHAOS-13` through `VTX-CHAOS-16` against the multi-pod baseline, including
+  rolling replacement and workload-isolation checks.
+5. Repeat the relevant cases under representative 60-, 120-, and 180-second handler
+  durations. Short synthetic calls validate control flow only; they do not validate lease
+  expiry or capacity behavior.
+
+Each run must use a unique run ID in topics, keys, logs, and evidence filenames. Before
+injecting a fault, capture the assigned partitions, committed offsets, ledger end offsets,
+active attempt IDs, and baseline dependency-effect count. After recovery, wait for the
+consumer group to stabilize, read outputs with `read_committed`, and compare those values.
+
+### Pass criteria
+
+A scenario passes only when all of the following are true:
+
+- every expected logical request reaches exactly one terminal Kafka disposition;
+- no source offset advances beyond an unfinished or unresolved prefix;
+- stale assignment epochs and fenced producers cannot publish accepted outputs;
+- completed ledger entries suppress duplicate business calls within retention;
+- retry and DLQ handoffs preserve workload, owner key, source coordinates, and generation;
+- liveness remains available while recovery is active, while readiness accurately reports
+  restoration or sustained failure; and
+- memory, event-loop delay, transaction queues, and tracking windows return to bounded
+  steady state after the fault is removed.
+
+An external side effect is considered safe only when the dependency's idempotency log proves
+that repeated delivery of one `jobId` caused one physical effect. Kafka output counts alone
+cannot establish that property.
+
+### Evidence record
+
+Store one machine-readable record and a short operator narrative per scenario. The record
+must include the run ID, image/build identifier, configuration, topic and group names,
+fault start/end, pod and slot identities, assignment history, committed offsets, ledger
+restore bounds, transaction IDs/states, readiness/liveness samples, relevant metrics,
+expected/actual logical outcomes, dependency-effect counts, and the final verdict.
+
+Link the record from the Spec 007 evidence report. A green local container-kill run covers
+`VTX-CHAOS-01` only in the local single-broker scope; it does not close `VTX-CHAOS-02`,
+`VTX-CHAOS-05`, multi-broker loss, network isolation, disk pressure, or production dependency
+acceptance gates.
+
 ## How to read the system during a failure
 
 The pipeline contains four independently observable queues:
