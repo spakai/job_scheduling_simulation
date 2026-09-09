@@ -149,9 +149,10 @@ are migration/reference systems, not production peers after cutover.
 ### 3.4 Workload topology and capacity baseline
 
 Use `subscriber-rerate` keyed by `subscriberId` with 10 partitions and 5 subscriber pods,
-each with one work-consumer verticle and 10 shared asynchronous execution slots. Kafka
-assigns approximately two partitions per pod; partition coordinators are local state, not
-consumer verticles. Use `subscribe`, not manual work assignment. Group processing uses its own
+each with one deployed `WorkerVerticle`, one work consumer, and 10 shared asynchronous
+execution slots. Kafka assigns approximately two partitions per pod; partition coordinators
+are local state inside the verticle, not consumer verticles. Use `subscribe`, not manual work
+assignment. Group processing uses its own
 topic/key, group, deployment, pool and limiter. Another group on the subscriber topic would
 receive all subscriber records and is not workload isolation.
 
@@ -270,7 +271,81 @@ an older callback cannot resolve a later half-open probe.
 | Ledger store | Restore and query completed identities per partition. | Lane/context-owned access. |
 | Backpressure | Decide pause, probe, resume, readiness. | Context-confined state machine. |
 
+### 5.4 Vert.x and Kafka execution units
+
+The deployment has one `WorkerVerticle` per worker pod. The verticle starts the health
+HTTP server and creates one `PullRuntime`; `PullRuntime` owns one subscribed Kafka consumer
+and the mutable assignment state for that pod. Vert.x does not create a verticle per job or
+per offset.
+
+```mermaid
+flowchart TB
+    subgraph pod["One worker pod / one JVM"]
+        main["Main"] --> verticle["WorkerVerticle"]
+        verticle --> health["Health and metrics HTTP server"]
+        verticle --> runtime["PullRuntime\nconsumer controller"]
+        runtime --> consumer["One Kafka consumer"]
+        runtime --> lanes["Partition lanes\none lane per assigned partition"]
+        lanes --> handlers["Concurrent job handlers"]
+    end
+    consumer --> group["Kafka consumer group\nassignment and rebalance"]
+    group --> partitions["Work topic partitions"]
+```
+
+Kafka distributes partitions among consumers with the same `group.id`. The producer key
+chooses the partition; the group coordinator chooses which consumer, and therefore which
+pod, owns that partition. A consumer polls records from all partitions currently assigned
+to it. The runtime then routes each record to its local partition lane.
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant K as Kafka topic
+    participant C as Kafka group coordinator
+    participant V1 as Pod A consumer
+    participant V2 as Pod B consumer
+    participant L as PullRuntime lane
+    participant H as Job handler
+
+    P->>K: Produce record with owner key
+    K->>K: Hash key to partition
+    C->>V1: Assign partition 0
+    C->>V2: Assign partition 1
+    K-->>V1: Poll records from partition 0
+    V1->>L: Register record in partition-0 lane
+    L->>H: Execute within pod and partition limits
+    H-->>L: Complete record
+    L->>K: Commit only a completed contiguous prefix
+```
+
+The concurrency limits apply after assignment: `MAX_IN_FLIGHT_PER_PARTITION` limits one
+lane, while `MAX_IN_FLIGHT_PER_POD` limits the sum of active handlers across all lanes in
+that pod. Deploying several verticles in one JVM would create several Kafka consumers, not
+one consumer per job; Kafka would distribute partitions among those consumers as additional
+members of the same group. The normal deployment therefore keeps one consumer controller per
+pod and obtains job concurrency through bounded asynchronous lanes.
+
 ## 6. Runtime View
+
+### 6.0 Assignment and dispatch
+
+```mermaid
+flowchart LR
+    key["Producer key\nsubscriberId or groupId"] --> hash["Kafka partitioner"]
+    hash --> topic["Work topic partition"]
+    topic --> group["Consumer group coordinator"]
+    group --> pod["One consumer in one pod"]
+    pod --> poll["Consumer poll"]
+    poll --> lane["Partition lane"]
+    lane --> limit["Pod and partition limits"]
+    limit --> job["Asynchronous job handler"]
+```
+
+Assignment is exclusive within a consumer group: two consumers in the same group do not
+simultaneously own one partition. A rebalance can move a partition to another consumer;
+the old lane is revoked and the new lane restores its ledger before becoming ready. This
+ownership rule is separate from handler concurrency: several jobs may run in one lane, but
+partition ownership remains with one consumer at a time.
 
 ### 6.1 Successful request
 
