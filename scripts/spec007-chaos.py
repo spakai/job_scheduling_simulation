@@ -15,7 +15,14 @@ COMPOSE = ["docker", "compose", "-f", "compose.yaml", "-f", "compose.spec007.yam
 
 
 def command(args):
-    return subprocess.run(args, cwd=ROOT, check=True, text=True, capture_output=True).stdout
+    try:
+        result = subprocess.run(args, cwd=ROOT, check=True, text=True, capture_output=True)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Required command is unavailable: {args[0]}") from error
+    except subprocess.CalledProcessError as error:
+        details = error.stderr.strip() or error.stdout.strip() or "no command output"
+        raise RuntimeError(f"Command failed ({error.returncode}): {' '.join(args)}\n{details}") from error
+    return result.stdout
 
 
 def main():
@@ -25,9 +32,10 @@ def main():
     args = parser.parse_args()
     if args.count < 1 or args.timeout < 1:
         parser.error("count and timeout must be positive")
+    command(COMPOSE + ["config", "--quiet"])
     container = command(COMPOSE + ["ps", "--quiet", "spec007-subscriber-0"]).strip()
     if not container:
-        raise RuntimeError("Start scripts/spec007 baseline first")
+        raise RuntimeError("Start scripts/spec007 baseline first; no subscriber container is running")
     produced = command(
         COMPOSE
         + [
@@ -87,4 +95,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as error:
+        raise SystemExit(str(error)) from error
