@@ -109,9 +109,7 @@ class ConfluentPullWorker:
             }
         )
         registry = SchemaRegistryClient({"url": config.schema_registry_url})
-        schema = registry.get_latest_version(
-            f"{config.lifecycle_topic}-value"
-        ).schema.schema_str
+        schema = registry.get_latest_version(f"{config.lifecycle_topic}-value").schema.schema_str
         self.edr_serializer = JSONSerializer(
             schema,
             registry,
@@ -249,9 +247,7 @@ class ConfluentPullWorker:
                 )
             )
         event_type = (
-            EventType.JOB_RETRIES_EXHAUSTED
-            if exhausted
-            else EventType.JOB_EXECUTION_FAILED
+            EventType.JOB_RETRIES_EXHAUSTED if exhausted else EventType.JOB_EXECUTION_FAILED
         )
         event = self._event(job, event_type, now, error_code=exc.code, retryable=exc.retryable)
         self._transaction(message, outputs, event)
